@@ -103,6 +103,39 @@ endif()
 # per-configuration variant: rexgpu-xenosd.dll for Debug, rexgpu-xenos.dll
 # for Release). Without it the game runs with no GPU emulation.
 rexglue_setup_target(fable_2 GPU_PLUGINS xenos)
+# In-tree SDK (REXSDK_DIR, the Linux build): the installed package ships the
+# imgui headers in its include dir, but rex::runtime does not propagate them
+# from the source tree. Add only the include path; linking rexui again would
+# duplicate code that already lives in the shared runtime.
+if(TARGET imgui::imgui)
+    target_include_directories(fable_2 SYSTEM PRIVATE
+        $<TARGET_PROPERTY:imgui::imgui,INTERFACE_INCLUDE_DIRECTORIES>)
+endif()
+# Linux: the in-tree shared runtime builds into the SDK's own out dir; stage
+# it next to the exe ($ORIGIN rpath) so the build folder runs as-is.
+if(UNIX AND NOT APPLE AND TARGET rexruntime)
+    add_custom_command(TARGET fable_2 POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_FILE:rexruntime> $<TARGET_FILE_DIR:fable_2>
+        VERBATIM)
+endif()
+# Linux settings launcher (SDL3 + Dear ImGui, see src/launcher/linux_launcher.cpp).
+# The Windows launcher is the WPF app in launcher/.
+if(UNIX AND NOT APPLE AND TARGET imgui)
+    set(_imgui_dir "${REXSDK_DIR}/thirdparty/imgui")
+    add_executable(fable2_launcher
+        src/launcher/linux_launcher.cpp
+        ${_imgui_dir}/backends/imgui_impl_sdl3.cpp
+        ${_imgui_dir}/backends/imgui_impl_sdlrenderer3.cpp)
+    target_include_directories(fable2_launcher PRIVATE
+        ${_imgui_dir} ${_imgui_dir}/backends "${REXSDK_DIR}/thirdparty/stb")
+    target_link_libraries(fable2_launcher PRIVATE imgui SDL3::SDL3)
+    target_compile_features(fable2_launcher PRIVATE cxx_std_20)
+    # Finds the bundled libc++ next to it (AppImage usr/bin), like fable_2.
+    set_target_properties(fable2_launcher PROPERTIES BUILD_RPATH "\$ORIGIN" INSTALL_RPATH "\$ORIGIN")
+    add_dependencies(fable_2 fable2_launcher)
+endif()
+
 add_custom_command(TARGET fable_2 POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_CURRENT_BINARY_DIR}/fable2_build.json"
@@ -126,7 +159,10 @@ target_compile_definitions(fable_2 PRIVATE
 # only useful for debugging). Defining FABLE2_REMOTE_CONTROL compiles the pad
 # driver registration + server start/stop into the app; without it (non-Debug)
 # those are #ifdef'd out entirely and no port is ever opened.
-if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+# FABLE2_FORCE_REMOTE_CONTROL=ON enables it in other configs for local
+# automated testing (never for shipped builds).
+option(FABLE2_FORCE_REMOTE_CONTROL "Compile the remote control server into non-Debug builds (local testing only)" OFF)
+if(CMAKE_BUILD_TYPE STREQUAL "Debug" OR FABLE2_FORCE_REMOTE_CONTROL)
     target_compile_definitions(fable_2 PRIVATE FABLE2_REMOTE_CONTROL)
 endif()
 
@@ -170,7 +206,16 @@ endif()
 # bottom of fable2_func_trace.h (which redefines REX_FUNC_PROLOGUE) runs with
 # the generated pch already loaded, and the patched macro is baked into the
 # PCH used by every recompiled TU.
-if(TARGET fable_2_recomp)
+# The hook costs a check at every guest function entry even when tracing is
+# off, so it is a build option; on by default on Windows (existing builds),
+# off on Linux.
+if(WIN32)
+    set(_fable2_func_trace_default ON)
+else()
+    set(_fable2_func_trace_default OFF)
+endif()
+option(FABLE2_FUNC_TRACE "Compile the guest function-call trace hook into fable_2_recomp" ${_fable2_func_trace_default})
+if(TARGET fable_2_recomp AND FABLE2_FUNC_TRACE)
     target_precompile_headers(fable_2_recomp PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src/core/fable2_func_trace.h)
 endif()

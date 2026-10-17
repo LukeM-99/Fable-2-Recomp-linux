@@ -16,8 +16,10 @@
 #include "fable2_state_probe.h"
 #include "fable2_menu_probe.h"  // main-menu input path (mod-menu hook points)
 #include "fable2_modmenu.h"  // 6th "MOD OPTION" selectable main-menu item
+#ifdef _WIN32
 #include "fable2_av_probe.h"  // self-installs a guest-PC AV logger (VEH)
 #include "fable2_stall_dump.h"  // self-installs a render-stall thread dumper
+#endif
 // #include "fable2_ui_render_probe.h"
 #include "keyboard_gamepad.h"
 

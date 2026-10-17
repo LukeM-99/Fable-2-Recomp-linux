@@ -24,15 +24,19 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
+#include <filesystem>
 #include <cstdarg>
 #include <cstddef>
 #include <cstdio>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <mutex>
 #include <string>
 
 #include "rex/cvar.h"
+#include "rex/logging.h"
 #include "rex/ppc/context.h"  // PPCContext
 
 // Guest-memory helpers (defined in src/diagnostics/fable2_text_append.h, which
@@ -63,6 +67,15 @@ REXCVAR_DEFINE_STRING(
     "External Lua file run by pressing F5 (host keyboard). Path as the "
     "CScriptManager::RunScript / loadfile resolves it, relative to the VFS "
     "root (data/). Default scripts/recomp/F5.lua -> <gamedataroot>/data/scripts/recomp/F5.lua.");
+
+// Main-scene render-target size below the native 1280x720 (sub-1x internal
+// resolution). Applied with the engine's own debug hook
+// Debug.EngineTest.SetMainSceneRenderTargetDimensions(w, h, msaa) (still in
+// the retail build; see data/scripts/Startup/DebugMenu.txt "Main Scene
+// Resolution"). The UI keeps rendering at 720p. Format "WxHxMSAA", e.g.
+// "960x544x2"; empty = game default (1280x720, 2x MSAA).
+REXCVAR_DEFINE_STRING(main_scene_resolution, "", "Fable2",
+                      "3D scene render size WxHxMSAA below 720p (e.g. 960x544x2); empty = default");
 
 // Current game-state name (defined in src/diagnostics/fable2_state_probe.h,
 // which is included later in main.cpp). Logged before each RunScript call so
@@ -123,6 +136,12 @@ inline void logline(const char* fmt, ...) {
   va_start(ap, fmt);
   std::vsnprintf(buf, sizeof buf, fmt, ap);
   va_end(ap);
+  // FABLE2_F5_LOG=1: mirror into the game log (diagnosing script runs).
+  static const bool to_log = [] {
+    const char* v = std::getenv("FABLE2_F5_LOG");
+    return v && v[0] == '1';
+  }();
+  if (to_log) REXSYS_INFO("{}", buf);
   std::lock_guard<std::mutex> l(log_mtx());
   if (std::FILE* f = logf()) {
     std::fputs(buf, f);
@@ -142,14 +161,13 @@ inline void poll_f5() {
 
 // Run the external Lua file via the captured CScriptManager::RunScript.
 // Returns true if invoked. Must be called from the guest main thread.
-inline bool run_external(PPCContext& ctx, uint8_t* base) {
+inline bool run_external(PPCContext& ctx, uint8_t* base, const std::string& path) {
   const uint32_t this_ptr = g_this.load();
   const uint32_t method = g_method.load();
   if (this_ptr == 0 || method == 0) {
     logline("[f5] requested but RunScript callable not captured yet\n");
     return false;
   }
-  const std::string path = REXCVAR_GET(f5_lua_path);
   if (path.empty()) return false;
 
   // Safety: the captured method must resolve to a real recompiled guest
@@ -246,7 +264,96 @@ inline bool run_external(PPCContext& ctx, uint8_t* base) {
 // Per-frame entry point. Called from the MainRenderLoop_82B9CD68 hook (in
 // fps_meter.h). Runs the external file when F5 is latched. This makes F5
 // responsive (fires on the very next frame).
+// --- Sub-1x main-scene resolution -----------------------------------------
+// Debug.EngineTest.SetMainSceneRenderTargetDimensions(w, h, msaa) is bound to
+// sub_825DA050, which only stores the three values into the renderer's
+// settings object: obj = (*0x83496920)->vfunc[5]() ; cfg = *(obj + 4);
+// cfg+148 = width, +152 = height, +156 = MSAA. The renderer rebuilds the main
+// scene targets when they change. Writing the fields directly (checked every
+// 30 frames on the guest main thread) needs no Lua and survives level loads
+// that reset them. Calling the Lua binding repeatedly during a load stalled
+// the load, so this is the only supported path.
+inline std::atomic<bool> g_resolution_enabled{false};
+inline int g_res_w = 0, g_res_h = 0, g_res_msaa = 2;
+
+inline bool ParseResolution(const std::string& v, int& w, int& h, int& msaa) {
+  msaa = 2;
+  const int n = std::sscanf(v.c_str(), "%dx%dx%d", &w, &h, &msaa);
+  return n >= 2 && w >= 320 && w <= 1280 && h >= 180 && h <= 720 &&
+         (msaa == 1 || msaa == 2 || msaa == 4);
+}
+
+// Called once at startup (reads the cvar).
+inline void InitResolution() {
+  const std::string value = REXCVAR_GET(main_scene_resolution);
+  if (value.empty()) return;
+  if (!ParseResolution(value, g_res_w, g_res_h, g_res_msaa)) {
+    REXSYS_WARN("[resolution] ignoring main_scene_resolution='{}' (want WxHxMSAA)", value);
+    return;
+  }
+  g_resolution_enabled = true;
+  REXSYS_INFO("[resolution] main scene {}x{} MSAA {}x", g_res_w, g_res_h, g_res_msaa);
+}
+
+inline void poll_resolution(PPCContext& ctx, uint8_t* base) {
+  if (!g_resolution_enabled.load(std::memory_order_relaxed)) return;
+  static uint32_t frame = 0;
+  if (++frame % 30 != 0) return;
+  // Rate-limited diagnostics for the pointer chain (every ~10 s at 3 fps).
+  const bool diag = (frame % 900) == 0;
+  auto fail = [&](const char* step, uint32_t v) {
+    if (diag) REXSYS_DEBUG("[resolution] chain stops at {} (0x{:08X})", step, v);
+  };
+  const uint32_t global = 0x83496920;
+  if (!ta::rdable2(base, global, 4)) return fail("global", global);
+  const uint32_t mgr = ta::load_be(base, global);
+  if (mgr < 0x1000 || mgr == 0xFFFFFFFF || !ta::rdable2(base, mgr, 4)) return fail("mgr", mgr);
+  const uint32_t vtbl = ta::load_be(base, mgr);
+  if (!ta::rdable2(base, vtbl + 20, 4)) return fail("vtbl", vtbl);
+  const uint32_t fn = ta::load_be(base, vtbl + 20);
+  if (fn < 0x82000000 || fn > 0x82FFFFFF || !rex::runtime::ResolveIndirectFunction(fn))
+    return fail("fn", fn);
+  const PPCContext saved = ctx;
+  ctx.r3.u32 = mgr;
+  REX_CALL_INDIRECT_FUNC(fn);
+  const uint32_t obj = ctx.r3.u32;
+  ctx = saved;
+  if (obj < 0x1000 || !ta::rdable2(base, obj + 4, 4)) return fail("obj", obj);
+  const uint32_t cfg = ta::load_be(base, obj + 4);
+  if (cfg < 0x1000 || !ta::rdable2(base, cfg + 148, 12) || !ta::wr2(base, cfg + 148, 12))
+    return fail("cfg", cfg);
+  {
+    static bool logged = false;
+    if (!logged) {
+      logged = true;
+      REXSYS_INFO("[resolution] renderer settings at guest 0x{:08X}", cfg);
+    }
+  }
+  const uint32_t cur_w = ta::load_be(base, cfg + 148);
+  const uint32_t cur_h = ta::load_be(base, cfg + 152);
+  const uint32_t cur_m = ta::load_be(base, cfg + 156);
+  if (cur_w == uint32_t(g_res_w) && cur_h == uint32_t(g_res_h) && cur_m == uint32_t(g_res_msaa))
+    return;
+  // Sanity: only touch it if it looks like the settings we expect (a sane
+  // resolution), so a wrong object never gets scribbled on.
+  if (cur_w < 320 || cur_w > 4096 || cur_h < 180 || cur_h > 4096 || cur_m > 16) {
+    static bool warned = false;
+    if (!warned) {
+      warned = true;
+      REXSYS_WARN("[resolution] unexpected settings {}x{}x{} at 0x{:08X}; not applying", cur_w,
+                  cur_h, cur_m, cfg);
+    }
+    return;
+  }
+  REXSYS_INFO("[resolution] main scene {}x{}x{} -> {}x{}x{}", cur_w, cur_h, cur_m, g_res_w, g_res_h,
+              g_res_msaa);
+  rex::memory::store_and_swap<uint32_t>(base + cfg + 148, uint32_t(g_res_w));
+  rex::memory::store_and_swap<uint32_t>(base + cfg + 152, uint32_t(g_res_h));
+  rex::memory::store_and_swap<uint32_t>(base + cfg + 156, uint32_t(g_res_msaa));
+}
+
 inline void poll_mainloop(PPCContext& ctx, uint8_t* base) {
+  poll_resolution(ctx, base);
   if (!g_f5_pending.exchange(false)) return;
   // run_external calls guest functions (ConstructRefCounted, the RunScript
   // method, DestructRefCounted) which clobber the PPC registers. Save the whole
@@ -256,7 +363,7 @@ inline void poll_mainloop(PPCContext& ctx, uint8_t* base) {
           (uint32_t)ctx.r1.u64, (uint32_t)ctx.r2.u64, (uint32_t)ctx.r3.u64);
   const PPCContext saved = ctx;
   try {
-    run_external(ctx, base);
+    run_external(ctx, base, REXCVAR_GET(f5_lua_path));
   } catch (...) {
   }
   ctx = saved;

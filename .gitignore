@@ -1,6 +1,7 @@
 # --- Game content (ripped disc; see README "How to extract") ---------------
 default.xex
 /data/
+*.iso
 /nxeart/
 /$SystemUpdate/
 /Gamefiles/
@@ -56,6 +57,12 @@ __pycache__/
 !tools/create_app_icon.ps1
 !assets/app-icon.png
 !docs/screenshots/launcher.png
+# Linux build + AppImage packaging
+!build-linux.sh
+!make-appimage.sh
+!tools/setup-linux-toolchain.sh
+!tools/gdfx_extract.py
+!tools/symbolize_profile.py
 
 # --- Fetched/external toolchain deps (created by tools/setup_sdk*.cmd). -------
 # The tracked files in thirdparty/ (rexglue-sdk-local.patch,
@@ -66,3 +73,13 @@ thirdparty/android-ndk/
 # --- Historical reference (pre-ReXGlue XenonRecomp configs) -------------------
 XenonRecomp
 TODO.md
+
+# --- Runtime state written into the game folder (saves, shader cache, config,
+#     logs) when running from the project root -----------------------------------
+/saves/
+/cache/
+/logs/
+/fable2_config.toml
+/fable_2.toml
+/launcher.toml
+profile.txt

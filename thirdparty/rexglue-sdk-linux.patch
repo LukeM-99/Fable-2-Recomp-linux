@@ -1,0 +1,1232 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 9b3cdf5..d46851c 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -117,10 +117,19 @@ endfunction()
+ if(NOT WIN32)
+     # Use appropriate code model based on architecture
+     if(CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64" AND NOT APPLE)
+-        # Large code model on Linux x86_64 for linking with very large recompiled executables (35MB+).
+         # macOS uses small: the ld64 linker on macOS 15+ rejects text relocations produced
+         # by -mcmodel=large, and macOS maps binaries in the low address space so ±2GB is sufficient.
+-        add_compile_options(-mcmodel=large)
++        # Linux used -mcmodel=large for very large recompiled executables, but that turns every
++        # guest->guest call into movabs + indirect call through the GOT (measured: a large share
++        # of guest CPU time). The small model covers 2 GB of code+data per binary, far above the
++        # ~100 MB a title produces, so it is the default; REXGLUE_LARGE_CODE_MODEL brings back the
++        # old behaviour should a title ever exceed it (link errors: relocation truncated).
++        option(REXGLUE_LARGE_CODE_MODEL "Use -mcmodel=large on Linux x86_64" OFF)
++        if(REXGLUE_LARGE_CODE_MODEL)
++            add_compile_options(-mcmodel=large)
++        else()
++            add_compile_options(-mcmodel=small)
++        endif()
+     else()
+         add_compile_options(-mcmodel=small)
+     endif()
+diff --git a/cmake/rexglue_helpers.cmake b/cmake/rexglue_helpers.cmake
+index 41e6dce..184f2f7 100644
+--- a/cmake/rexglue_helpers.cmake
++++ b/cmake/rexglue_helpers.cmake
+@@ -48,8 +48,10 @@ function(rexglue_apply_target_settings target_name)
+     if(UNIX AND NOT APPLE)
+         # Large executable support
+         if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+-            target_link_options(${target_name} PRIVATE -Wl,--no-relax)
+-            target_compile_options(${target_name} PRIVATE -mcmodel=large)
++            if(REXGLUE_LARGE_CODE_MODEL)
++                target_link_options(${target_name} PRIVATE -Wl,--no-relax)
++                target_compile_options(${target_name} PRIVATE -mcmodel=large)
++            endif()
+         elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64")
+             target_compile_options(${target_name} PRIVATE -march=armv8-a)
+         endif()
+diff --git a/include/rex/chrono/chrono.h b/include/rex/chrono/chrono.h
+index d876846..739116c 100644
+--- a/include/rex/chrono/chrono.h
++++ b/include/rex/chrono/chrono.h
+@@ -116,8 +116,8 @@ using XSystemClock = detail::NtSystemClock<detail::Domain::Guest>;
+ 
+ namespace std::chrono {
+ 
+-#ifdef __APPLE__
+-// Apple libc++ does not expose clock_time_conversion or clock_cast.
++#if defined(_LIBCPP_VERSION)
++// libc++ (Apple and LLVM) does not expose clock_time_conversion or clock_cast.
+ template <class, class>
+ struct clock_time_conversion {};
+ 
+diff --git a/include/rex/graphics/shared_memory.h b/include/rex/graphics/shared_memory.h
+index 4d85a2b..c845921 100644
+--- a/include/rex/graphics/shared_memory.h
++++ b/include/rex/graphics/shared_memory.h
+@@ -13,6 +13,7 @@
+ #include <cstdint>
+ #include <mutex>
+ #include <utility>
++#include <algorithm>
+ #include <vector>
+ 
+ #include <rex/memory.h>
+@@ -95,6 +96,12 @@ class SharedMemory {
+   // regions in those pages.
+   void RangeWrittenByGpu(uint32_t start, uint32_t length);
+ 
++  // Per-submission tracking of GPU accesses (64 KB blocks), so a backend can
++  // move uploads of not-yet-accessed memory to the start of the submission
++  // instead of breaking render passes mid-stream. Call when opening a
++  // submission.
++  void BeginTouchEpoch() { ++touch_epoch_; }
++
+  protected:
+   SharedMemory(memory::Memory& memory);
+   // Call in implementation-specific initialization.
+@@ -161,6 +168,30 @@ class SharedMemory {
+   // persistently allocated vector).
+   std::vector<std::pair<uint32_t, uint32_t>> upload_ranges_;
+ 
++ protected:
++  static constexpr uint32_t kTouchBlockLog2 = 16;
++  std::vector<uint32_t> touch_epoch_block_ =
++      std::vector<uint32_t>(size_t(1) << (kBufferSizeLog2 - kTouchBlockLog2), 0);
++  uint32_t touch_epoch_ = 1;
++  void MarkTouched(uint32_t start, uint32_t length) {
++    if (!length) return;
++    const uint32_t first = start >> kTouchBlockLog2;
++    const uint32_t last = std::min(uint32_t((uint64_t(start) + length - 1) >> kTouchBlockLog2),
++                                   uint32_t(touch_epoch_block_.size() - 1));
++    for (uint32_t i = first; i <= last; ++i) touch_epoch_block_[i] = touch_epoch_;
++  }
++  bool IsAnyTouched(uint32_t start, uint32_t length) const {
++    if (!length) return false;
++    const uint32_t first = start >> kTouchBlockLog2;
++    const uint32_t last = std::min(uint32_t((uint64_t(start) + length - 1) >> kTouchBlockLog2),
++                                   uint32_t(touch_epoch_block_.size() - 1));
++    for (uint32_t i = first; i <= last; ++i)
++      if (touch_epoch_block_[i] == touch_epoch_) return true;
++    return false;
++  }
++
++ private:
++
+   // Mutex between the guest memory subsystem and the command processor, to be
+   // locked when checking or updating validity of pages/ranges and when firing
+   // watches.
+diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
+index 696ff48..85a2da5 100644
+--- a/include/rex/graphics/vulkan/command_processor.h
++++ b/include/rex/graphics/vulkan/command_processor.h
+@@ -47,6 +47,7 @@ namespace rex::graphics::vulkan {
+ 
+ class VulkanCommandProcessor : public CommandProcessor {
+  public:
++  bool IsSubmissionOpen() const { return submission_open_; }
+   // Single-descriptor layouts for use within a single frame.
+   enum class SingleTransientDescriptorLayout {
+     kStorageBufferCompute,
+diff --git a/include/rex/graphics/vulkan/shared_memory.h b/include/rex/graphics/vulkan/shared_memory.h
+index 104bdad..5a05333 100644
+--- a/include/rex/graphics/vulkan/shared_memory.h
++++ b/include/rex/graphics/vulkan/shared_memory.h
+@@ -55,6 +55,13 @@ class VulkanSharedMemory : public SharedMemory {
+ 
+   bool UploadRanges(const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) override;
+ 
++ public:
++  // Records the uploads deferred to the start of the current submission (see
++  // UploadRanges) into the real command buffer, before the deferred commands.
++  void FlushPrologueUploads(VkCommandBuffer command_buffer);
++
++ protected:
++
+  private:
+   void GetUsageMasks(Usage usage, VkPipelineStageFlags& stage_mask,
+                      VkAccessFlags& access_mask) const;
+@@ -72,6 +79,11 @@ class VulkanSharedMemory : public SharedMemory {
+ 
+   std::unique_ptr<ui::vulkan::VulkanUploadBufferPool> upload_buffer_pool_;
+   std::vector<VkBufferCopy> upload_regions_;
++  struct PrologueCopy {
++    VkBuffer source;
++    VkBufferCopy region;
++  };
++  std::vector<PrologueCopy> prologue_copies_;
+ };
+ 
+ }  // namespace rex::graphics::vulkan
+diff --git a/include/rex/ui/presenter.h b/include/rex/ui/presenter.h
+index 8808c1a..5810ea1 100644
+--- a/include/rex/ui/presenter.h
++++ b/include/rex/ui/presenter.h
+@@ -1039,6 +1039,30 @@ class Presenter {
+   // presentation requests to prevent adding arbitrary amounts of latency to it.
+   // On Android and GTK, this is not needed, the frame rate of draw events is
+   // limited to the display refresh rate internally.
++  // Emulated guest vblank counter (incremented by OnGuestVblank on every
++  // emulated vblank interrupt). This runs at the configured refresh rate
++  // (~60 Hz, or ~1000 Hz when guest_vblank_pacing is off), independent of how
++  // often the game actually renders a frame; reported in the pacer's rate
++  // diagnostic.
++  std::atomic<uint64_t> guest_vblank_count_{0};
++  // Guest frame counter (incremented by RefreshGuestOutput on every rendered
++  // guest frame). This is the game's *actual* render rate (the source of the
++  // F3 FPS counter) and the cadence the pacer (GuestVblankPaceAllows) gates
++  // the host present to.
++  std::atomic<uint64_t> guest_frame_count_{0};
++  // Pacer: at most one host present per rendered guest frame.
++  // `guest_frame_pace_last_count_` is the last-presented guest frame count,
++  // claimed from the UI / guest-output threads via a compare-and-swap.
++  std::atomic<uint64_t> guest_frame_pace_last_count_{0};
++  // Diagnostic rate window (sampled once per second): host presents and
++  // suppressed presents since the window start, plus the guest frame and vblank
++  // counts at the window start (to compute the actual cadences). Benign races;
++  // used only for the rate-limited info log.
++  std::atomic<uint64_t> guest_frame_pace_present_count_{0};
++  std::atomic<uint64_t> guest_frame_pace_suppressed_{0};
++  std::atomic<uint64_t> guest_frame_pace_window_start_ms_{0};
++  std::atomic<uint64_t> guest_frame_pace_window_start_frame_count_{0};
++  std::atomic<uint64_t> guest_frame_pace_window_start_vblank_count_{0};
+ #if REX_PLATFORM_WIN32
+   static Microsoft::WRL::ComPtr<IDXGIOutput> GetDXGIOutputForMonitor(IDXGIFactory1* factory,
+                                                                      HMONITOR monitor);
+@@ -1074,30 +1098,6 @@ class Presenter {
+   std::atomic<uint64_t> vsync_present_gate_last_present_tick_{0};
+   std::atomic<uint64_t> vsync_present_gate_suppressed_{0};
+   uint64_t vsync_present_gate_last_log_time_ms_ = 0;
+-  // Emulated guest vblank counter (incremented by OnGuestVblank on every
+-  // emulated vblank interrupt). This runs at the configured refresh rate
+-  // (~60 Hz, or ~1000 Hz when guest_vblank_pacing is off), independent of how
+-  // often the game actually renders a frame; reported in the pacer's rate
+-  // diagnostic.
+-  std::atomic<uint64_t> guest_vblank_count_{0};
+-  // Guest frame counter (incremented by RefreshGuestOutput on every rendered
+-  // guest frame). This is the game's *actual* render rate (the source of the
+-  // F3 FPS counter) and the cadence the pacer (GuestVblankPaceAllows) gates
+-  // the host present to.
+-  std::atomic<uint64_t> guest_frame_count_{0};
+-  // Pacer: at most one host present per rendered guest frame.
+-  // `guest_frame_pace_last_count_` is the last-presented guest frame count,
+-  // claimed from the UI / guest-output threads via a compare-and-swap.
+-  std::atomic<uint64_t> guest_frame_pace_last_count_{0};
+-  // Diagnostic rate window (sampled once per second): host presents and
+-  // suppressed presents since the window start, plus the guest frame and vblank
+-  // counts at the window start (to compute the actual cadences). Benign races;
+-  // used only for the rate-limited info log.
+-  std::atomic<uint64_t> guest_frame_pace_present_count_{0};
+-  std::atomic<uint64_t> guest_frame_pace_suppressed_{0};
+-  std::atomic<uint64_t> guest_frame_pace_window_start_ms_{0};
+-  std::atomic<uint64_t> guest_frame_pace_window_start_frame_count_{0};
+-  std::atomic<uint64_t> guest_frame_pace_window_start_vblank_count_{0};
+   // If output is null or shutdown is true, the signal may not be sent, either
+   // don't limit the frame rate in this case (an exceptional situation, such as
+   // a failure to find the output in DXGI), or don't draw at all if the window
+diff --git a/src/core/memory_posix.cpp b/src/core/memory_posix.cpp
+index b52bf39..c437061 100644
+--- a/src/core/memory_posix.cpp
++++ b/src/core/memory_posix.cpp
+@@ -9,6 +9,8 @@
+  * @modified    Tom Clay & Rien Gupta, 2026 - Adapted for ReXGlue runtime (POSIX + macOS)
+  */
+ 
++#include <algorithm>
++#include <atomic>
+ #include <cerrno>
+ #include <cstddef>
+ #include <cstdio>
+@@ -234,6 +236,97 @@ static PageAccess PermsToPageAccess(const char perms[5]) {
+   return w ? PageAccess::kReadWrite : PageAccess::kReadOnly;
+ }
+ 
++// Shadow of the page protections applied through this file (AllocFixed,
++// DeallocFixed, Protect, MapFileView, UnmapFileView), so QueryProtect does not
++// have to parse /proc/self/maps. That parse is very slow and sits on the hot
++// path: every guest write to a GPU-watched page faults into
++// MMIOHandler::ExceptionCallback, which re-queries the page protection while
++// holding the global lock the GPU command processor also needs.
++// Two levels: 1 GiB chunks of the 47-bit user address space, then one byte
++// per host page (0 = unknown -> fall back to /proc, else PageAccess + 1).
++// Lookups are lock-free and never allocate (safe in the signal handler).
++constexpr unsigned kShadowChunkShift = 30;
++constexpr size_t kShadowChunkCount = size_t(1) << (47 - kShadowChunkShift);
++std::atomic<std::atomic<uint8_t>*> g_shadow_chunks[kShadowChunkCount];
++
++inline unsigned ShadowPageShift() {
++  static const unsigned shift = unsigned(__builtin_ctzll(uint64_t(getpagesize())));
++  return shift;
++}
++
++std::atomic<uint8_t>* ShadowChunk(size_t index, bool create) {
++  std::atomic<uint8_t>* chunk = g_shadow_chunks[index].load(std::memory_order_acquire);
++  if (chunk || !create) {
++    return chunk;
++  }
++  const size_t pages = size_t(1) << (kShadowChunkShift - ShadowPageShift());
++  auto* fresh = new std::atomic<uint8_t>[pages]();
++  if (g_shadow_chunks[index].compare_exchange_strong(chunk, fresh, std::memory_order_acq_rel)) {
++    return fresh;
++  }
++  delete[] fresh;
++  return chunk;
++}
++
++// state: 0 = forget (unknown), otherwise PageAccess + 1.
++void ShadowSet(const void* base_address, size_t length, uint8_t state) {
++  if (!length) {
++    return;
++  }
++  const unsigned page_shift = ShadowPageShift();
++  uintptr_t page = reinterpret_cast<uintptr_t>(base_address) >> page_shift;
++  const uintptr_t page_end =
++      (reinterpret_cast<uintptr_t>(base_address) + length + (uintptr_t(1) << page_shift) - 1) >>
++      page_shift;
++  const unsigned chunk_page_shift = kShadowChunkShift - page_shift;
++  const uintptr_t chunk_page_mask = (uintptr_t(1) << chunk_page_shift) - 1;
++  while (page < page_end) {
++    const size_t chunk_index = page >> chunk_page_shift;
++    const uintptr_t run_end = std::min(page_end, (uintptr_t(chunk_index) + 1) << chunk_page_shift);
++    if (chunk_index >= kShadowChunkCount) {
++      return;
++    }
++    if (std::atomic<uint8_t>* chunk = ShadowChunk(chunk_index, state != 0)) {
++      for (uintptr_t p = page; p < run_end; ++p) {
++        chunk[p & chunk_page_mask].store(state, std::memory_order_relaxed);
++      }
++    }
++    page = run_end;
++  }
++}
++
++inline void ShadowSetAccess(const void* base_address, size_t length, PageAccess access) {
++  ShadowSet(base_address, length, uint8_t(uint8_t(access) + 1));
++}
++
++// Returns 0 when the page is unknown.
++inline uint8_t ShadowGet(const void* address) {
++  const unsigned page_shift = ShadowPageShift();
++  const uintptr_t page = reinterpret_cast<uintptr_t>(address) >> page_shift;
++  const unsigned chunk_page_shift = kShadowChunkShift - page_shift;
++  const size_t chunk_index = page >> chunk_page_shift;
++  if (chunk_index >= kShadowChunkCount) {
++    return 0;
++  }
++  std::atomic<uint8_t>* chunk = ShadowChunk(chunk_index, false);
++  if (!chunk) {
++    return 0;
++  }
++  return chunk[page & ((uintptr_t(1) << chunk_page_shift) - 1)].load(std::memory_order_relaxed);
++}
++
++inline bool ShadowRangeKnown(const void* base_address, size_t length) {
++  const size_t page = size_t(1) << ShadowPageShift();
++  const uintptr_t begin = reinterpret_cast<uintptr_t>(base_address) & ~uintptr_t(page - 1);
++  const uintptr_t end = reinterpret_cast<uintptr_t>(base_address) + length;
++  for (uintptr_t a = begin; a < end; a += page) {
++    if (!ShadowGet(reinterpret_cast<const void*>(a))) {
++      return false;
++    }
++  }
++  return true;
++}
++
+ }  // namespace
+ #endif  // REX_PLATFORM_LINUX
+ 
+@@ -296,6 +389,10 @@ void* AllocFixed(void* base_address, size_t length, AllocationType allocation_ty
+ 
+   void* result = mmap(base_address, length, prot_initial, flags, -1, 0);
+   if (result != MAP_FAILED) {
++#if REX_PLATFORM_LINUX
++    ShadowSetAccess(result, length,
++                    allocation_type == AllocationType::kReserve ? PageAccess::kNoAccess : access);
++#endif
+     return result;
+   }
+ #if defined(MAP_FIXED_NOREPLACE) && REX_PLATFORM_LINUX
+@@ -305,8 +402,9 @@ void* AllocFixed(void* base_address, size_t length, AllocationType allocation_ty
+       (allocation_type == AllocationType::kCommit ||
+        allocation_type == AllocationType::kReserveCommit)) {
+     // Verify the entire range is mapped before using mprotect
+-    if (IsRangeFullyMapped(base_address, length)) {
++    if (ShadowRangeKnown(base_address, length) || IsRangeFullyMapped(base_address, length)) {
+       if (mprotect(base_address, length, static_cast<int>(prot_requested)) == 0) {
++        ShadowSetAccess(base_address, length, access);
+         return base_address;
+       }
+     }
+@@ -323,12 +421,18 @@ bool DeallocFixed(void* base_address, size_t length, DeallocationType deallocati
+       if (mprotect(base_address, length, PROT_NONE) != 0) {
+         return false;
+       }
++#if REX_PLATFORM_LINUX
++      ShadowSetAccess(base_address, length, PageAccess::kNoAccess);
++#endif
+ #if defined(MADV_DONTNEED)
+       (void)madvise(base_address, length, MADV_DONTNEED);
+ #endif
+       return true;
+     }
+     case DeallocationType::kRelease: {
++#if REX_PLATFORM_LINUX
++      ShadowSet(base_address, length, 0);
++#endif
+       return munmap(base_address, length) == 0;
+     }
+     default:
+@@ -357,15 +461,24 @@ bool Protect(void* base_address, size_t length, PageAccess access, PageAccess* o
+   //             atomic in a mutli-threaded process either, but it's something to be aware of.
+   // Query old access before changing, if the caller needs it
+   if (out_old_access) {
+-    LinuxMapEntry e;
+-    if (FindEntryForAddress(base_address, e)) {
+-      *out_old_access = PermsToPageAccess(e.perms);
++    if (uint8_t state = ShadowGet(base_address)) {
++      *out_old_access = PageAccess(state - 1);
++    } else {
++      LinuxMapEntry e;
++      if (FindEntryForAddress(base_address, e)) {
++        *out_old_access = PermsToPageAccess(e.perms);
++      }
+     }
+   }
+ #endif
+ 
+   uint32_t prot = ToPosixProtectFlags(access);
+   int ret = mprotect(base_address, length, prot);
++#if REX_PLATFORM_LINUX
++  if (ret == 0) {
++    ShadowSetAccess(base_address, length, access);
++  }
++#endif
+   if (ret != 0) {
+     REXSYS_ERROR("mprotect({}, 0x{:X}, {}) failed: {} ({})", base_address, length, prot,
+                  strerror(errno), errno);
+@@ -416,6 +529,15 @@ bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out) {
+   access_out = PageAccess::kNoAccess;
+   length = 0;
+ 
++  if (uint8_t state = ShadowGet(base_address)) {
++    // Only this page is guaranteed (no caller needs the full region length).
++    const uintptr_t addr = reinterpret_cast<uintptr_t>(base_address);
++    const uintptr_t page = uintptr_t(page_size());
++    length = static_cast<size_t>(((addr + page) & ~(page - 1)) - addr);
++    access_out = PageAccess(state - 1);
++    return true;
++  }
++
+   LinuxMapEntry e;
+   if (!FindEntryForAddress(base_address, e)) {
+     return false;
+@@ -483,6 +605,11 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, siz
+     shm_unlink(full_path.c_str());
+     return kFileMappingHandleInvalid;
+   }
++  // Only the fd is used from here on (views map the fd), so drop the name now:
++  // the kernel frees the memory when the last fd/mapping goes away. Otherwise
++  // every hard exit or crash (CloseFileMappingHandle never runs) leaks the
++  // whole guest-memory file in /dev/shm, eating RAM until reboot.
++  shm_unlink(full_path.c_str());
+   return static_cast<FileMappingHandle>(ret);
+ #endif
+ }
+@@ -525,10 +652,16 @@ void* MapFileView(FileMappingHandle handle, void* base_address, size_t length, P
+     return nullptr;
+   }
+ 
++#if REX_PLATFORM_LINUX
++  ShadowSetAccess(result, length, access);
++#endif
+   return result;
+ }
+ 
+ bool UnmapFileView(FileMappingHandle handle, void* base_address, size_t length) {
++#if REX_PLATFORM_LINUX
++  ShadowSet(base_address, length, 0);
++#endif
+   return munmap(base_address, length) == 0;
+ }
+ 
+diff --git a/src/core/threading_posix.cpp b/src/core/threading_posix.cpp
+index 9ac8d15..778002c 100644
+--- a/src/core/threading_posix.cpp
++++ b/src/core/threading_posix.cpp
+@@ -414,8 +414,11 @@ class PosixConditionBase {
+       if (timeout == std::chrono::milliseconds::max()) {
+         std::this_thread::sleep_for(std::chrono::milliseconds(1));
+       } else {
+-        auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - now);
+-        auto sleep_time = std::min(remaining, std::chrono::milliseconds(1));
++        // Microsecond precision: truncating the remaining time to whole
++        // milliseconds made the last (and, for the 1 ms alertable slices,
++        // every) iteration sleep_for(0), i.e. a busy spin.
++        auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(end_time - now);
++        auto sleep_time = std::min(remaining, std::chrono::microseconds(1000));
+         std::this_thread::sleep_for(sleep_time);
+       }
+     }
+diff --git a/src/core/timer_queue.cpp b/src/core/timer_queue.cpp
+index 5cfea05..5c7ff19 100644
+--- a/src/core/timer_queue.cpp
++++ b/src/core/timer_queue.cpp
+@@ -15,7 +15,7 @@
+ #include <disruptorplus/multi_threaded_claim_strategy.hpp>
+ #include <disruptorplus/ring_buffer.hpp>
+ #include <disruptorplus/sequence_barrier.hpp>
+-#include <disruptorplus/spin_wait_strategy.hpp>
++#include <disruptorplus/blocking_wait_strategy.hpp>
+ 
+ #include <rex/assert.h>
+ #include <rex/thread.h>
+@@ -69,7 +69,10 @@ class TimerQueue {
+         // Consume new wait items and add them to sorted wait queue
+         dp::sequence_t available = claim_strategy_.wait_until_published(
+             next_sequence, next_sequence - 1,
+-            wait_queue_.empty() ? clock::time_point::max() : wait_queue_.front()->due_);
++            // (No pending timer: wake hourly; time_point::max() would overflow
++            // inside condition_variable::wait_until.)
++            wait_queue_.empty() ? clock::now() + std::chrono::hours(1)
++                                : wait_queue_.front()->due_);
+ 
+         // Check for timeout
+         if (available != next_sequence - 1) {
+@@ -142,9 +145,15 @@ class TimerQueue {
+   // This ring buffer will be used to introduce timers queued by the public API
+   static constexpr size_t kWaitCount = 512;
+   dp::ring_buffer<std::shared_ptr<WaitItem>> buffer_;
+-  dp::spin_wait_strategy wait_strategy_;
+-  dp::multi_threaded_claim_strategy<dp::spin_wait_strategy> claim_strategy_;
+-  dp::sequence_barrier<dp::spin_wait_strategy> consumed_;
++  // Blocking (condition variable) rather than spin waiting: the spin
++  // strategy's idle loop is sched_yield with a 1 ms sleep every 20th
++  // iteration, which keeps this thread at ~100% of a core whenever its CPU has
++  // nothing else to run - on a 4-core laptop that is a core (and power budget)
++  // taken from the GPU command processor.
++  using wait_strategy = dp::blocking_wait_strategy;
++  wait_strategy wait_strategy_;
++  dp::multi_threaded_claim_strategy<wait_strategy> claim_strategy_;
++  dp::sequence_barrier<wait_strategy> consumed_;
+ 
+   // This is a _sorted_ (ascending due_) list of active timers managed by a
+   // dedicated thread
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index dcbcbbc..1d2097c 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include <algorithm>
++#include <vector>
+ #include <cctype>
+ #include <cinttypes>
+ #include <cmath>
+@@ -298,6 +299,11 @@ bool CommandProcessor::ShouldForceReadbackResolve(uint32_t base) const {
+ }
+ 
+ bool CommandProcessor::IsReadbackMemexportEnabled(bool legacy_backend_flag) const {
++  // Called for every draw: skip the (allocating) by-name cvar lookup when
++  // both answers agree.
++  if (legacy_backend_flag == REXCVAR_GET(readback_memexport)) {
++    return legacy_backend_flag;
++  }
+   if (legacy_readback_memexport_cvar_name_ &&
+       rex::cvar::HasNonDefaultValue(legacy_readback_memexport_cvar_name_)) {
+     return legacy_backend_flag;
+@@ -471,7 +477,16 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
+ 
+   // Volatile for the WAIT_REG_MEM loop.
+   const_cast<volatile uint32_t&>(regs.values[index]) = value;
+-  if (!regs.GetRegisterInfo(index)) {
++  // GetRegisterInfo is a huge switch (with a guarded static per case); only
++  // the debug log needs it, so answer "known?" from a table built once.
++  static const std::vector<bool> known_registers = [] {
++    std::vector<bool> known(RegisterFile::kRegisterCount);
++    for (uint32_t i = 0; i < RegisterFile::kRegisterCount; ++i) {
++      known[i] = RegisterFile::GetRegisterInfo(i) != nullptr;
++    }
++    return known;
++  }();
++  if (!known_registers[index]) {
+     REXGPU_DEBUG("GPU: Write to unknown register ({:04X} = {:08X})", index, value);
+   }
+ 
+@@ -818,6 +833,13 @@ bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t p
+ 
+   uint32_t base_index = (packet & 0x7FFF);
+   uint32_t write_one_reg = (packet >> 15) & 0x1;
++  if (!write_one_reg) {
++    // Sequential range: use the (backend-overridable) batched path, which
++    // handles whole constant ranges with one copy instead of a virtual
++    // WriteRegister call per register (the hottest packet type).
++    WriteRegisterRangeFromRing(reader, base_index, count);
++    return true;
++  }
+   for (uint32_t m = 0; m < count; m++) {
+     uint32_t reg_data = reader->ReadAndSwap<uint32_t>();
+     uint32_t target_index = write_one_reg ? base_index : base_index + m;
+diff --git a/src/graphics/pipeline/render_target/cache.cpp b/src/graphics/pipeline/render_target/cache.cpp
+index 953c5fd..616b13b 100644
+--- a/src/graphics/pipeline/render_target/cache.cpp
++++ b/src/graphics/pipeline/render_target/cache.cpp
+@@ -10,6 +10,11 @@
+  */
+ 
+ #include <algorithm>
++#include <cstdlib>
++#include <vector>
++#include <string>
++#include <map>
++#include <chrono>
+ #include <cmath>
+ #include <cstring>
+ #include <iterator>
+@@ -690,6 +695,65 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
+                     interlock_barrier_only ? nullptr : &last_update_transfers_[rt_bit_index]);
+   }
+ 
++  // FABLE2_GPU_WAIT_LOG=1 (diagnostics): for draws that need transfers, how
++  // the used height compares with the render target's possible height.
++  {
++    static const bool log_on = [] {
++      const char* v = std::getenv("FABLE2_GPU_WAIT_LOG");
++      return v && v[0] == '1';
++    }();
++    if (log_on && !interlock_barrier_only) {
++      static std::map<std::string, std::pair<uint64_t, uint64_t>> stats;  // tiles, count
++      static auto last = std::chrono::steady_clock::now();
++      for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
++        uint32_t idx = edram_bases_sorted[i].second;
++        uint64_t t = 0;
++        for (const Transfer& tr : last_update_transfers_[idx]) t += tr.end_tiles - tr.start_tiles;
++        if (!t) continue;
++        const RenderTargetKey& k = rt_keys[idx];
++        // Signature of the draw that needed the transfer: would it overwrite
++        // the whole destination anyway?
++        std::string draw_sig;
++        const auto prim = regs.Get<reg::VGT_DRAW_INITIATOR>().prim_type;
++        const bool clip_off = regs.Get<reg::PA_CL_CLIP_CNTL>().clip_disable;
++        if (k.is_depth) {
++          const reg::RB_DEPTHCONTROL& dc = normalized_depth_control;
++          draw_sig = fmt::format("z{}w{}f{} st{}", uint32_t(dc.z_enable), uint32_t(dc.z_write_enable),
++                                 uint32_t(dc.zfunc), uint32_t(dc.stencil_enable));
++        } else {
++          const uint32_t mask = (normalized_color_mask >> (4 * (idx - 1))) & 0xF;
++          static const uint32_t blend_regs[] = {XE_GPU_REG_RB_BLENDCONTROL0,
++                                                XE_GPU_REG_RB_BLENDCONTROL1,
++                                                XE_GPU_REG_RB_BLENDCONTROL2,
++                                                XE_GPU_REG_RB_BLENDCONTROL3};
++          const auto bc = regs.Get<reg::RB_BLENDCONTROL>(blend_regs[idx - 1]);
++          const bool blend = !(bc.color_srcblend == xenos::BlendFactor::kOne &&
++                               bc.color_destblend == xenos::BlendFactor::kZero &&
++                               bc.color_comb_fcn == xenos::BlendOp::kAdd);
++          draw_sig = fmt::format("mask{:x} blend{} atest{}", mask, uint32_t(blend),
++                                 uint32_t(regs.Get<reg::RB_COLORCONTROL>().alpha_test_enable));
++        }
++        draw_sig += fmt::format(" prim{} clipoff{}", uint32_t(prim), uint32_t(clip_off));
++        auto& e = stats[fmt::format("{}{}@{}p{}x{} h_used={} len={} | {}", k.is_depth ? "D" : "C",
++                                    k.resource_format, k.base_tiles, k.pitch_tiles_at_32bpp,
++                                    1u << uint32_t(k.msaa_samples), height_used,
++                                    rt_lengths_tiles[i], draw_sig)];
++        e.first += t;
++        e.second++;
++      }
++      const auto now = std::chrono::steady_clock::now();
++      if (now - last >= std::chrono::seconds(5)) {
++        last = now;
++        std::vector<std::pair<uint64_t, std::string>> top;
++        for (auto& [k, v] : stats) top.emplace_back(v.first, fmt::format("{} (n={})", k, v.second));
++        std::sort(top.rbegin(), top.rend());
++        for (size_t j = 0; j < top.size() && j < 10; ++j)
++          REXGPU_INFO("[rt-used] {:>8} tiles  {}", top[j].first, top[j].second);
++        stats.clear();
++      }
++    }
++  }
++
+   if (interlock_barrier_only) {
+     // No copying transfers or render target bindings - only needed the barrier.
+     return true;
+diff --git a/src/graphics/shared_memory.cpp b/src/graphics/shared_memory.cpp
+index ec0df7c..b6f38d1 100644
+--- a/src/graphics/shared_memory.cpp
++++ b/src/graphics/shared_memory.cpp
+@@ -259,6 +259,7 @@ void SharedMemory::RangeWrittenByGpu(uint32_t start, uint32_t length) {
+     return;
+   }
+   length = std::min(length, kBufferSize - start);
++  MarkTouched(start, length);
+   uint32_t end = start + length - 1;
+   uint32_t page_first = start >> page_size_log2_;
+   uint32_t page_last = end >> page_size_log2_;
+@@ -461,11 +462,13 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
+   COUNT_profile_set("gpu/shared_memory/request_ranges_upload_count",
+                     uint32_t(upload_ranges_.size()));
+ 
+-  if (upload_ranges_.empty()) {
+-    return true;
++  // Upload first (the uploader checks whether this submission touched the
++  // pages before), then record this request's GPU access.
++  const bool upload_ok = upload_ranges_.empty() || UploadRanges(upload_ranges_);
++  for (const std::pair<uint32_t, uint32_t>& range : merged_ranges) {
++    MarkTouched(range.first, range.second);
+   }
+-
+-  return UploadRanges(upload_ranges_);
++  return upload_ok;
+ }
+ 
+ bool SharedMemory::RequestRange(uint32_t start, uint32_t length) {
+diff --git a/src/graphics/util/draw_extent_estimator.cpp b/src/graphics/util/draw_extent_estimator.cpp
+index 3027dc8..6da94c6 100644
+--- a/src/graphics/util/draw_extent_estimator.cpp
++++ b/src/graphics/util/draw_extent_estimator.cpp
+@@ -24,7 +24,11 @@
+ #include <rex/memory.h>
+ #include <rex/ui/graphics_util.h>
+ 
+-REXCVAR_DEFINE_BOOL(execute_unclipped_draw_vs_on_cpu, false, "GPU",
++// On by default (as in upstream Xenia): without it, screen-space (clip
++// disabled) draws are assumed to cover the whole EDRAM height, so every
++// render-target ownership change copies the entire EDRAM. Fable II: ~3x less
++// transfer traffic and +30% FPS on an Intel UHD 620.
++REXCVAR_DEFINE_BOOL(execute_unclipped_draw_vs_on_cpu, true, "GPU",
+                     "Execute unclipped draw vertex shader on CPU");
+ 
+ REXCVAR_DEFINE_BOOL(execute_unclipped_draw_vs_on_cpu_with_scissor, false, "GPU",
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index f677401..1abce61 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -10,6 +10,10 @@
+  */
+ 
+ #include <algorithm>
++#include <chrono>
++#include <cstdlib>
++#include <unordered_map>
++#include <dlfcn.h>
+ #include <array>
+ #include <cstdint>
+ #include <cstring>
+@@ -51,6 +55,25 @@ REXCVAR_DEFINE_BOOL(vulkan_readback_resolve, false, "GPU/Vulkan",
+                     "Read render-to-texture results on the CPU")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++// FABLE2_GPU_WAIT_LOG=1 (diagnostics): GPU command thread cost breakdown.
++namespace rex::graphics::vulkan::gpustats {
++bool enabled() {
++  static const bool on = [] {
++    const char* v = std::getenv("FABLE2_GPU_WAIT_LOG");
++    return v && v[0] == '1';
++  }();
++  return on;
++}
++uint64_t frames, draws, draw_ns, bindings_ns, descriptor_writes, submits, submit_ns, execute_ns;
++uint64_t command_counts[32];
++uint64_t phase_ns[12];
++uint64_t NowNs() {
++  return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                      std::chrono::steady_clock::now().time_since_epoch())
++                      .count());
++}
++}  // namespace rex::graphics::vulkan::gpustats
++
+ REXCVAR_DEFINE_BOOL(vulkan_readback_memexport, false, "GPU/Vulkan",
+                     "Read data written by memory export in shaders on the CPU")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+@@ -2271,6 +2294,42 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
+ 
+ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
+                                        uint32_t frontbuffer_height) {
++  if (gpustats::enabled()) {
++    using namespace gpustats;
++    ++frames;
++    static uint64_t last = NowNs();
++    const uint64_t now = NowNs();
++    if (now - last >= 5000000000ull && frames) {
++      const double f = double(frames);
++      REXGPU_INFO(
++          "[gpu-cost] per frame: {:.0f} draws, IssueDraw {:.1f} ms (bindings {:.1f}), "
++          "replay {:.1f} ms, {:.1f} submits {:.1f} ms, {:.0f} descriptor writes",
++          draws / f, draw_ns / f / 1e6, bindings_ns / f / 1e6, execute_ns / f / 1e6, submits / f,
++          submit_ns / f / 1e6, descriptor_writes / f);
++      static const char* names[] = {"BeginRP", "BeginQuery", "BindDS", "BindIB", "BindPipe",
++                                    "BindVB", "ClearAtt", "ClearImg", "CopyBuf", "CopyBufImg",
++                                    "CopyQuery", "Dispatch", "Draw", "DrawIdx", "EndQuery",
++                                    "EndRP", "BeginRend", "EndRend", "Barrier", "PushConst",
++                                    "ResetQuery", "Blend", "DepthBias", "Scissor", "StCmp",
++                                    "StRef", "StWrite", "Viewport"};
++      std::string line;
++      for (size_t i = 0; i < 28; ++i)
++        if (command_counts[i]) line += fmt::format("{}={:.0f} ", names[i], command_counts[i] / f);
++      REXGPU_INFO("[gpu-cost] vk commands per frame: {}", line);
++      static const char* phase_names[] = {"prologue+begin_submission(waits)", "primitive",
++                                          "shaders+samplers", "textures", "rt_update",
++                                          "pipeline", "dyn_state", "sysconst", "bindings", "-",
++                                          "tail"};
++      std::string pl;
++      for (int i = 0; i < 11; ++i) pl += fmt::format("{}={:.1f} ", phase_names[i], phase_ns[i] / f / 1e6);
++      REXGPU_INFO("[gpu-cost] IssueDraw phases ms/frame: {}", pl);
++      std::memset(phase_ns, 0, sizeof(phase_ns));
++      frames = draws = draw_ns = bindings_ns = descriptor_writes = submits = submit_ns =
++          execute_ns = 0;
++      std::memset(command_counts, 0, sizeof(command_counts));
++      last = now;
++    }
++  }
+   SCOPE_profile_cpu_f("gpu");
+   vertex_buffers_in_sync_[0] = 0;
+   vertex_buffers_in_sync_[1] = 0;
+@@ -3590,6 +3649,23 @@ Shader* VulkanCommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32
+ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
+                                        IndexBufferInfo* index_buffer_info,
+                                        bool major_mode_explicit) {
++  struct DrawTimer {
++    uint64_t start = gpustats::enabled() ? gpustats::NowNs() : 0;
++    uint64_t last = start;
++    void Mark(int phase) {
++      if (!start) return;
++      const uint64_t now = gpustats::NowNs();
++      gpustats::phase_ns[phase] += now - last;
++      last = now;
++    }
++    ~DrawTimer() {
++      if (start) {
++        Mark(10);
++        gpustats::draw_ns += gpustats::NowNs() - start;
++        ++gpustats::draws;
++      }
++    }
++  } draw_timer;
+ #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
+   SCOPE_profile_cpu_f("gpu");
+ #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+@@ -3708,6 +3784,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+     }
+ 
+     // Process primitives.
++  draw_timer.Mark(0);
+     if (!primitive_processor_->Process(primitive_processing_result)) {
+       return draw_fail("primitive_processing");
+     }
+@@ -3738,6 +3815,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+     }
+ 
+     // Shader modifications.
++  draw_timer.Mark(1);
+     vertex_shader_modification = pipeline_cache_->GetCurrentVertexShaderModification(
+         *vertex_shader, primitive_processing_result.host_vertex_shader_type, interpolator_mask,
+         ps_param_gen_pos != UINT32_MAX);
+@@ -3835,10 +3913,12 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+   uint32_t used_texture_mask =
+       vertex_shader->GetUsedTextureMaskAfterTranslation() |
+       (pixel_shader != nullptr ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0);
++  draw_timer.Mark(2);
+   texture_cache_->RequestTextures(used_texture_mask);
+ 
+   const VulkanPipelineCache::PipelineLayoutProvider* pipeline_layout_provider;
+   // Set up the render targets - this may perform dispatches and draws.
++  draw_timer.Mark(3);
+   if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
+                                     normalized_color_mask, *vertex_shader)) {
+     return draw_fail("render_target_update");
+@@ -3849,6 +3929,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+   // textures.
+   VkPipeline pipeline;
+   void* pipeline_handle = nullptr;
++  draw_timer.Mark(4);
+   if (!pipeline_cache_->ConfigurePipeline(vertex_shader_translation, pixel_shader_translation,
+                                           primitive_processing_result, normalized_depth_control,
+                                           normalized_color_mask,
+@@ -3861,6 +3942,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+   // may happen between pipeline configuration and binding.
+   pipeline_cache_->GetPipelineAndLayoutByHandle(pipeline_handle, pipeline, pipeline_layout_provider,
+                                                 &pipeline_is_placeholder);
++  draw_timer.Mark(5);
+   if (REXCVAR_GET(async_shader_compilation) && pipeline_is_placeholder) {
+     frame_used_async_placeholder_pipeline_ = true;
+     return true;
+@@ -3967,13 +4049,19 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+   }
+ 
+   // Update system constants before uploading them.
++  draw_timer.Mark(6);
+   UpdateSystemConstantValues(primitive_polygonal, primitive_processing_result,
+                              shader_32bit_index_dma, 0, viewport_info, used_texture_mask,
+                              normalized_depth_control, normalized_color_mask);
+ 
+   // Update uniform buffers and descriptor sets after binding the pipeline with
+   // the new layout.
+-  if (!UpdateBindings(vertex_shader, pixel_shader)) {
++  draw_timer.Mark(7);
++  const uint64_t bindings_start = gpustats::enabled() ? gpustats::NowNs() : 0;
++  const bool bindings_ok = UpdateBindings(vertex_shader, pixel_shader);
++  if (bindings_start) gpustats::bindings_ns += gpustats::NowNs() - bindings_start;
++  draw_timer.Mark(8);
++  if (!bindings_ok) {
+     return draw_fail("update_bindings");
+   }
+ 
+@@ -4983,9 +5071,34 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
+     // defined by vkQueueSubmit additionally include in the first
+     // synchronization scope all commands that occur earlier in submission
+     // order."
++    // FABLE2_GPU_WAIT_LOG=1 (diagnostics): time blocking fence waits per
++    // caller and log the top callers every 5 s (offsets in librexruntime.so).
++    static const bool wait_log = [] {
++      const char* v = std::getenv("FABLE2_GPU_WAIT_LOG");
++      return v && v[0] == '1';
++    }();
++    const auto wait_start = std::chrono::steady_clock::now();
+     VkResult wait_result =
+         dfn.vkWaitForFences(device, uint32_t(await_submission - submission_completed_),
+                             submissions_in_flight_fences_.data(), VK_TRUE, UINT64_MAX);
++    if (wait_log) {
++      static std::unordered_map<uintptr_t, std::pair<uint64_t, uint64_t>> by_caller;
++      static auto last = std::chrono::steady_clock::now();
++      const auto now = std::chrono::steady_clock::now();
++      auto& e = by_caller[reinterpret_cast<uintptr_t>(__builtin_return_address(0))];
++      e.first += uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(now - wait_start).count());
++      e.second++;
++      if (now - last >= std::chrono::seconds(5)) {
++        last = now;
++        Dl_info info{};
++        for (const auto& [pc, v] : by_caller) {
++          uintptr_t off = pc;
++          if (dladdr(reinterpret_cast<void*>(pc), &info)) off = pc - uintptr_t(info.dli_fbase);
++          REXGPU_INFO("[gpu-wait] caller +0x{:x}: {} ms in {} waits", off, v.first / 1000, v.second);
++        }
++        by_caller.clear();
++      }
++    }
+     if (wait_result == VK_SUCCESS) {
+       fences_awaited += await_submission - submission_completed_;
+     } else {
+@@ -5144,6 +5257,9 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
+ 
+   if (!submission_open_) {
+     submission_open_ = true;
++    if (shared_memory_) {
++      shared_memory_->BeginTouchEpoch();
++    }
+ 
+     // Start a new deferred command buffer - will submit it to the real one in
+     // the end of the submission (when async pipeline object creation requests
+@@ -5398,6 +5514,9 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
+       REXGPU_ERROR("Failed to begin a Vulkan command buffer");
+       return false;
+     }
++    if (shared_memory_) {
++      shared_memory_->FlushPrologueUploads(command_buffer.buffer);
++    }
+     deferred_command_buffer_.Execute(command_buffer.buffer);
+     if (dfn.vkEndCommandBuffer(command_buffer.buffer) != VK_SUCCESS) {
+       REXGPU_ERROR("Failed to end a Vulkan command buffer");
+@@ -5430,7 +5549,12 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
+     {
+       ui::vulkan::VulkanDevice::Queue::Acquisition queue_acquisition =
+           vulkan_device->AcquireQueue(vulkan_device->queue_family_graphics_compute(), 0);
++      const uint64_t submit_start = gpustats::enabled() ? gpustats::NowNs() : 0;
+       submit_result = dfn.vkQueueSubmit(queue_acquisition.queue(), 1, &submit_info, fence);
++      if (submit_start) {
++        gpustats::submit_ns += gpustats::NowNs() - submit_start;
++        ++gpustats::submits;
++      }
+     }
+     if (submit_result != VK_SUCCESS) {
+       REXGPU_ERROR("Failed to submit a Vulkan command buffer");
+@@ -6721,6 +6845,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+   }
+   // Write.
+   if (write_descriptor_set_count) {
++    gpustats::descriptor_writes += write_descriptor_set_count;
+     dfn.vkUpdateDescriptorSets(device, write_descriptor_set_count, write_descriptor_sets.data(), 0,
+                                nullptr);
+   }
+diff --git a/src/graphics/vulkan/deferred_command_buffer.cpp b/src/graphics/vulkan/deferred_command_buffer.cpp
+index b49e033..788030a 100644
+--- a/src/graphics/vulkan/deferred_command_buffer.cpp
++++ b/src/graphics/vulkan/deferred_command_buffer.cpp
+@@ -32,7 +32,21 @@ void DeferredCommandBuffer::Reset() {
+   command_stream_.clear();
+ }
+ 
++namespace gpustats {
++bool enabled();
++uint64_t NowNs();
++extern uint64_t execute_ns;
++extern uint64_t command_counts[32];
++}  // namespace gpustats
++
+ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
++  struct ExecTimer {
++    uint64_t start = gpustats::enabled() ? gpustats::NowNs() : 0;
++    ~ExecTimer() {
++      if (start) gpustats::execute_ns += gpustats::NowNs() - start;
++    }
++  } exec_timer;
++  const bool count_commands = gpustats::enabled();
+ #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
+   SCOPE_profile_cpu_f("gpu");
+ #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+@@ -46,6 +60,7 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
+     stream += kCommandHeaderSizeElements;
+     stream_remaining -= kCommandHeaderSizeElements;
+ 
++    if (count_commands) ++gpustats::command_counts[size_t(header.command) & 31];
+     switch (header.command) {
+       case Command::kVkBeginRenderPass: {
+         auto& args = *reinterpret_cast<const ArgsVkBeginRenderPass*>(stream);
+diff --git a/src/graphics/vulkan/render_target_cache.cpp b/src/graphics/vulkan/render_target_cache.cpp
+index 0298f06..8dbeba8 100644
+--- a/src/graphics/vulkan/render_target_cache.cpp
++++ b/src/graphics/vulkan/render_target_cache.cpp
+@@ -10,6 +10,10 @@
+  */
+ 
+ #include <algorithm>
++#include <chrono>
++#include <map>
++#include <string>
++#include <cstdlib>
+ #include <array>
+ #include <cstddef>
+ #include <cstdint>
+@@ -4558,6 +4562,48 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
+   DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
+ 
+   bool resolve_clear_needed = render_target_resolve_clear_values && resolve_clear_rectangle;
++
++  // FABLE2_GPU_WAIT_LOG=1 (diagnostics): transfer volume per second.
++  {
++    static const bool log_on = [] {
++      const char* v = std::getenv("FABLE2_GPU_WAIT_LOG");
++      return v && v[0] == '1';
++    }();
++    if (log_on && render_target_transfers) {
++      static uint64_t calls = 0, transfers = 0, tiles = 0, depth_tiles = 0;
++      static auto last = std::chrono::steady_clock::now();
++      static std::map<std::string, uint64_t> by_pair;
++      auto desc = [](const RenderTargetKey& k) {
++        return fmt::format("{}{}@{}p{}x{}", k.is_depth ? "D" : "C", k.resource_format, k.base_tiles,
++                           k.pitch_tiles_at_32bpp, 1u << uint32_t(k.msaa_samples));
++      };
++      for (uint32_t i = 0; i < render_target_count; ++i) {
++        if (!render_targets[i]) continue;
++        const bool is_depth = render_targets[i]->key().is_depth;
++        for (const Transfer& t : render_target_transfers[i]) {
++          ++transfers;
++          tiles += t.end_tiles - t.start_tiles;
++          if (is_depth) depth_tiles += t.end_tiles - t.start_tiles;
++          by_pair[desc(t.source->key()) + " -> " + desc(render_targets[i]->key())] +=
++              t.end_tiles - t.start_tiles;
++        }
++      }
++      ++calls;
++      const auto now = std::chrono::steady_clock::now();
++      if (now - last >= std::chrono::seconds(5)) {
++        last = now;
++        REXGPU_INFO("[rt-transfer] 5s: {} calls, {} transfers, {} EDRAM tiles ({} depth)", calls,
++                    transfers, tiles, depth_tiles);
++        std::vector<std::pair<uint64_t, std::string>> top;
++        for (auto& [k, v] : by_pair) top.emplace_back(v, k);
++        std::sort(top.rbegin(), top.rend());
++        for (size_t j = 0; j < top.size() && j < 8; ++j)
++          REXGPU_INFO("[rt-transfer]   {:>8} tiles  {}", top[j].first, top[j].second);
++        by_pair.clear();
++        calls = transfers = tiles = depth_tiles = 0;
++      }
++    }
++  }
+   VkClearRect resolve_clear_rect;
+   if (resolve_clear_needed) {
+     // Assuming the rectangle is already clamped by the setup function from the
+diff --git a/src/graphics/vulkan/shared_memory.cpp b/src/graphics/vulkan/shared_memory.cpp
+index 6788214..614425e 100644
+--- a/src/graphics/vulkan/shared_memory.cpp
++++ b/src/graphics/vulkan/shared_memory.cpp
+@@ -27,6 +27,11 @@ REXCVAR_DEFINE_BOOL(vulkan_sparse_shared_memory, true, "GPU/Vulkan",
+                     "Use sparse shared memory on Vulkan")
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ 
++REXCVAR_DEFINE_BOOL(vulkan_hoist_shared_memory_uploads, true, "GPU/Vulkan",
++                    "Move guest memory uploads that nothing in the submission accessed yet to "
++                    "the start of the submission (fewer render pass splits and barriers)")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ namespace rex::graphics::vulkan {
+ 
+ VulkanSharedMemory::VulkanSharedMemory(VulkanCommandProcessor& command_processor,
+@@ -273,19 +278,38 @@ bool VulkanSharedMemory::UploadRanges(
+   if (upload_page_ranges.empty()) {
+     return true;
+   }
+-  // upload_page_ranges are sorted, use them to determine the range for the
+-  // ordering barrier.
+-  Use(Usage::kTransferDestination,
+-      std::make_pair(upload_page_ranges.front().first << page_size_log2(),
+-                     (upload_page_ranges.back().first + upload_page_ranges.back().second -
+-                      upload_page_ranges.front().first)
+-                         << page_size_log2()));
+-  command_processor_.SubmitBarriers(true);
++  const uint32_t span_start = upload_page_ranges.front().first << page_size_log2();
++  const uint32_t span_length =
++      (upload_page_ranges.back().first + upload_page_ranges.back().second -
++       upload_page_ranges.front().first)
++      << page_size_log2();
++  // If nothing earlier in this submission accessed these pages, the copy can
++  // run at the very start of the submission (FlushPrologueUploads) with the
++  // same result - without ending the current render pass and draining the
++  // GPU with a transfer barrier pair per upload.
++  const bool hoist = REXCVAR_GET(vulkan_hoist_shared_memory_uploads) &&
++                     command_processor_.IsSubmissionOpen() &&
++                     !IsAnyTouched(span_start, span_length);
++  if (!hoist) {
++    Use(Usage::kTransferDestination, std::make_pair(span_start, span_length));
++    command_processor_.SubmitBarriers(true);
++  }
+   DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
+   uint64_t submission_current = command_processor_.GetCurrentSubmission();
+   bool successful = true;
+   upload_regions_.clear();
+   VkBuffer upload_buffer_previous = VK_NULL_HANDLE;
++  auto emit = [&](VkBuffer source) {
++    if (hoist) {
++      for (const VkBufferCopy& region : upload_regions_) {
++        prologue_copies_.push_back({source, region});
++      }
++    } else {
++      command_buffer.CmdVkCopyBuffer(source, buffer_, uint32_t(upload_regions_.size()),
++                                     upload_regions_.data());
++    }
++    upload_regions_.clear();
++  };
+   for (auto upload_range : upload_page_ranges) {
+     uint32_t upload_range_start = upload_range.first;
+     uint32_t upload_range_length = upload_range.second;
+@@ -306,9 +330,7 @@ bool VulkanSharedMemory::UploadRanges(
+                   upload_buffer_size);
+       if (upload_buffer_previous != upload_buffer && !upload_regions_.empty()) {
+         assert_true(upload_buffer_previous != VK_NULL_HANDLE);
+-        command_buffer.CmdVkCopyBuffer(upload_buffer_previous, buffer_,
+-                                       uint32_t(upload_regions_.size()), upload_regions_.data());
+-        upload_regions_.clear();
++        emit(upload_buffer_previous);
+       }
+       upload_buffer_previous = upload_buffer;
+       VkBufferCopy& upload_region = upload_regions_.emplace_back();
+@@ -325,13 +347,44 @@ bool VulkanSharedMemory::UploadRanges(
+   }
+   if (!upload_regions_.empty()) {
+     assert_true(upload_buffer_previous != VK_NULL_HANDLE);
+-    command_buffer.CmdVkCopyBuffer(upload_buffer_previous, buffer_,
+-                                   uint32_t(upload_regions_.size()), upload_regions_.data());
+-    upload_regions_.clear();
++    emit(upload_buffer_previous);
+   }
+   return successful;
+ }
+ 
++void VulkanSharedMemory::FlushPrologueUploads(VkCommandBuffer command_buffer) {
++  if (prologue_copies_.empty()) {
++    return;
++  }
++  const ui::vulkan::VulkanDevice::Functions& dfn =
++      command_processor_.GetVulkanDevice()->functions();
++  // Everything earlier on the queue (previous submissions) must be done with
++  // the buffer before it is overwritten, and the copies must be visible to
++  // everything in this submission.
++  VkMemoryBarrier barrier = {};
++  barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
++  barrier.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
++  barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
++  dfn.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
++                           VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
++  std::vector<VkBufferCopy> regions;
++  size_t i = 0;
++  while (i < prologue_copies_.size()) {
++    const VkBuffer source = prologue_copies_[i].source;
++    regions.clear();
++    for (; i < prologue_copies_.size() && prologue_copies_[i].source == source; ++i) {
++      regions.push_back(prologue_copies_[i].region);
++    }
++    dfn.vkCmdCopyBuffer(command_buffer, source, buffer_, uint32_t(regions.size()), regions.data());
++  }
++  barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
++  barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
++  dfn.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
++                           VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &barrier, 0, nullptr, 0,
++                           nullptr);
++  prologue_copies_.clear();
++}
++
+ void VulkanSharedMemory::GetUsageMasks(Usage usage, VkPipelineStageFlags& stage_mask,
+                                        VkAccessFlags& access_mask) const {
+   switch (usage) {
+diff --git a/src/system/CMakeLists.txt b/src/system/CMakeLists.txt
+index fdfd166..2408417 100644
+--- a/src/system/CMakeLists.txt
++++ b/src/system/CMakeLists.txt
+@@ -72,10 +72,12 @@ endif()
+ # type"). The flag must reach lld-link (not clang++), so it is passed via
+ # -Xlinker; and the path must be space-free (the project path contains spaces),
+ # so it is made relative to the top-level build dir (the linker's working dir).
+-file(RELATIVE_PATH REXRUNTIME_DEF_REL "${CMAKE_BINARY_DIR}" "${REXRUNTIME_DEF}")
+-set_target_properties(rexruntime PROPERTIES
+-    LINK_DEPENDS "${REXRUNTIME_DEF}"
+-    LINK_OPTIONS "-Xlinker;/DEF:${REXRUNTIME_DEF_REL}")
++if(WIN32)
++    file(RELATIVE_PATH REXRUNTIME_DEF_REL "${CMAKE_BINARY_DIR}" "${REXRUNTIME_DEF}")
++    set_target_properties(rexruntime PROPERTIES
++        LINK_DEPENDS "${REXRUNTIME_DEF}"
++        LINK_OPTIONS "-Xlinker;/DEF:${REXRUNTIME_DEF_REL}")
++endif()
+ 
+ rex_target_pch(rexruntime
+     <mutex>
+diff --git a/thirdparty/CMakeLists.txt b/thirdparty/CMakeLists.txt
+index f102b56..b32a733 100644
+--- a/thirdparty/CMakeLists.txt
++++ b/thirdparty/CMakeLists.txt
+@@ -267,7 +267,9 @@ else()
+         set(SDL_VULKAN OFF CACHE BOOL "" FORCE)
+     endif()
+ endif()
+-set(SDL_RENDER OFF CACHE BOOL "" FORCE)
++# SDL_RENDER is only used by standalone tools (e.g. a settings launcher drawing
++# ImGui through SDL_Renderer); the runtime itself does not touch it.
++set(SDL_RENDER ON CACHE BOOL "" FORCE)
+ set(SDL_HAPTIC OFF CACHE BOOL "" FORCE)
+ set(SDL_SENSOR OFF CACHE BOOL "" FORCE)
+ set(SDL_POWER OFF CACHE BOOL "" FORCE)
+diff --git a/thirdparty/disruptorplus/include/disruptorplus/blocking_wait_strategy.hpp b/thirdparty/disruptorplus/include/disruptorplus/blocking_wait_strategy.hpp
+index 32d427d..23fd3e1 100644
+--- a/thirdparty/disruptorplus/include/disruptorplus/blocking_wait_strategy.hpp
++++ b/thirdparty/disruptorplus/include/disruptorplus/blocking_wait_strategy.hpp
+@@ -118,11 +118,11 @@ namespace disruptorplus
+                 std::unique_lock<std::mutex> lock(m_mutex);
+                 m_cv.wait_for(
+                     lock,
++                    timeout,
+                     [&]() -> bool {
+                         result = minimum_sequence_after(sequence, count, sequences);
+                         return difference(result, sequence) >= 0;
+-                    },
+-                    timeout);
++                    });
+             }
+             return result;
+         }
+@@ -171,11 +171,11 @@ namespace disruptorplus
+                 std::unique_lock<std::mutex> lock(m_mutex);
+                 m_cv.wait_until(
+                     lock,
++                    timeoutTime,
+                     [&]() -> bool {
+                         result = minimum_sequence_after(sequence, count, sequences);
+                         return difference(result, sequence) >= 0;
+-                    },
+-                    timeoutTime);
++                    });
+             }
+             return result;
+         }

@@ -99,6 +99,9 @@
 //   }
 #include "fable_2_pch.h"
 
+#include <chrono>
+#include <thread>
+
 extern "C" void CallActivePlayerMethod_821A11E8(PPCContext& ctx, uint8_t* base);
 extern "C" void ConstructRefCounted_8222CF18(PPCContext& ctx, uint8_t* base);
 extern "C" void DispatchFrameCallback_821A6010(PPCContext& ctx, uint8_t* base);
@@ -1070,17 +1073,34 @@ extern "C" void ProcessGameFrame_82276C30(PPCContext& __restrict ctx, uint8_t* b
 	if (!ctx.cr6.eq) {
 	setup_frame(ctx, base);
 	// ===== Main per-frame work loop: drain pending work, decrement the budget =====
+	// Between game ticks this loop only re-reads the clock and yields. On the
+	// console the thread had a hardware thread to itself; on a PC the
+	// sched_yield spin keeps a core (and package power) busy that the GPU
+	// command processor needs. After a few idle passes, sleep briefly instead
+	// (same "give up the CPU" meaning; ticks are 33-66 ms apart, so ~0.2 ms of
+	// extra wake-up latency is invisible). Linux only: Windows keeps the
+	// original behaviour.
+	int idle_passes = 0;
 	do {
 	if (!frame_gate(ctx, base)) break;
 	compute_loop_timing(ctx, base);
 	// ble 0x82277208  (big block runs when cr0.gt, else yield)
 	if (ctx.cr0.gt) {
+	idle_passes = 0;
 	process_frame_work(ctx, base);
 	} else {
 	// --- (no work on this path) yield + re-check the frame threshold ---
 	// bl 0x82cbd098
 	ctx.lr = 0x8227720C;
+#if defined(__linux__)
+	if (++idle_passes > 8) {
+	  std::this_thread::sleep_for(std::chrono::microseconds(200));
+	} else {
+	  Yield_82CBD098(ctx, base);
+	}
+#else
 	Yield_82CBD098(ctx, base);
+#endif
 	}
 	check_loop_backedge(ctx, base);
 	} while (!ctx.cr6.eq);

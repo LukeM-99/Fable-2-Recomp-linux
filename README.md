@@ -24,8 +24,8 @@ Original GOTY USA/Europe and German GOTY dumps are supported by the default
 
 [ ] Increased performance / framerate\
 [x] Hero / Dog Texture bug fix (upstream renderer, verified on German GOTY)\
-[ ] Vulkan support\
-[ ] Linux Builds\
+[x] Vulkan support (Linux)\
+[x] Linux Builds (AppImage + launcher, see [docs/LINUX.md](docs/LINUX.md))\
 [x] Custom commands to aid in debugging\
 [ ] Improved Graphics rendering\
 [ ] Custom menu(s) / modifying menus for extra functionality (like closing the game)\
@@ -63,6 +63,110 @@ Recompiled and use new project-owned icons.
 
 
 
+
+## Linux (AppImage)
+
+Linux builds ship as a single `Fable2-Recompiled-x86_64.AppImage` running on
+the Vulkan backend, with its own settings launcher. The launcher extracts the
+game from your ISO, and offers presets, sub-720p internal resolutions and
+frame caps. The port also carries Linux-specific rendering and CPU performance
+fixes. See [docs/LINUX.md](docs/LINUX.md) for usage, building from source and
+diagnostics.
+
+### Linux performance notes: goals and roadblocks
+
+The test machine was a power-limited laptop: an Intel i5-8350U with UHD 620
+graphics (Mesa ANV). The goal was a stable 30 FPS in gameplay. We didn't reach
+it. This section records what we tried, what each change was worth, and where
+the limit is, so the next person doesn't repeat the dead ends.
+
+**Background.** ReXGlue statically recompiles the game's PowerPC code into
+native C++, so the game logic is not emulated and is not the bottleneck. The
+Xbox 360 GPU (Xenos) still has to be translated at run time. On the "GPU
+Commands" thread, every game draw is decoded from the command ring and turned
+into Vulkan state, descriptors and a draw. The game also reuses the same
+10 MB of EDRAM for different render-target formats: 1x, 2x and 4x MSAA, and
+depth versus colour. The emulator has to copy and convert ("transfer") those
+tiles every time ownership changes.
+
+**Where we started.** Gameplay ran at about 3.4 FPS. The menus also felt slow.
+
+**What worked:**
+
+| Change | Effect |
+|---|---|
+| Fixed the guest-memory shm leak in `/dev/shm` (SIGBUS after crashes) | Stability |
+| Shadow page-protection table instead of parsing `/proc/self/maps` on every fault | Large CPU cut during loading and streaming |
+| Timer queue, `WaitMultiple`, game idle loop and frame limiter sleep instead of busy-spinning | Frees CPU cores, so more of the shared power budget goes to the GPU |
+| Function-call trace hook made optional (off on Linux), no `-mcmodel=large` | Cheaper calls on every guest function |
+| `execute_unclipped_draw_vs_on_cpu` on by default: draw bounds come from running the vertex shader on the CPU, instead of assuming full-EDRAM draws | About 3x less render-target transfer traffic. The biggest single win. |
+| Command processor: known-register bitset, batched type-0 register writes, readback fast path | Less per-packet CPU |
+| Launcher Performance preset (800x448 without MSAA, memexport readback off, motion blur off, 30 FPS cap) | Combined, gameplay went from about 3.4 FPS to **about 11 FPS**. Menus run at 22–24 FPS. |
+
+**Sub-720p internal resolution.** The game hard-codes its main-scene render
+target (1120x720 with 2x MSAA). We found the engine's render settings object
+and now write the size and MSAA into it (`main_scene_resolution`). The
+launcher exposes 640x360, 800x448 and 960x544. It works, but even large drops
+in resolution gained only a little. That told us the frame isn't limited by
+pixel count; it's limited by the number of draws and EDRAM transfers.
+
+**Measuring the frame.** We added env-gated instrumentation: `FABLE2_PROFILE`,
+`FABLE2_GPU_WAIT_LOG`, and Mesa's `INTEL_MEASURE` for GPU timings. A gameplay
+frame (about 90 ms at 11 FPS) looks like this:
+
+- **Draws:** 1,770–3,100 per frame, depending on where the camera points.
+- **GPU-command thread, about 36–45 ms per frame:**
+  - Fence waits (waiting on the GPU): 25–31 ms.
+  - Descriptor and binding updates: 8–12 ms, about 9k–17k descriptor writes.
+  - Draw tail: 6–9 ms.
+  - Textures: 4–6 ms.
+  - Render-target updates: 3–5 ms.
+  - Shaders: 3–4 ms.
+  - Primitive processing: 2–4 ms.
+  - Replay: 6–15 ms.
+  - Submit: about 1 ms.
+- **GPU:** saturated, at about 950–1000 of its 1100 MHz (power-limited).
+
+**The CPU translation question.** The original plan was to stop translating
+the GPU commands every frame and replay them directly. The measurements argue
+against it as an FPS fix on this machine: the GPU-command thread spends most of
+its time waiting on fences, so the GPU is the bottleneck. Making translation
+cheaper can't raise FPS until GPU time comes down.
+
+**Independent review (Claude Fable 5.1 agent).** We had a Fable 5.1 agent
+review the renderer for performance avenues. It reached the same conclusion
+from the code (GPU first, about 77 ms; CPU translation about 45 ms) and
+proposed the following, which we then tested:
+
+| # | Avenue | Result |
+|---|---|---|
+| 1 | Hoist shared-memory uploads to the start of the submission (one batch, outside render passes) when nothing earlier in that submission touches the memory | **Implemented and kept** (`vulkan_hoist_shared_memory_uploads`). Barriers fell from about 1,200 to 900 per frame and render passes from 531 to 441. Replay is about 2 ms faster and the picture is identical. FPS didn't change (10.7 to 10.8), so the GPU wasn't stalling on those barriers. |
+| 2 | Dynamic uniform buffers for constants, instead of rebuilding a descriptor set per draw | Not done. Saves an estimated 3–5 ms of CPU, which doesn't help while GPU-bound. |
+| 3 | Reuse texture descriptor sets when unchanged (there's a `TODO` in `vulkan/command_processor.cpp`) | Not done. Saves an estimated 0.5–2 ms of CPU. |
+| 4 | Move replay and submit to a worker thread | Not done. Saves about 6.7 ms of CPU, but only pays off once the GPU is under about 40 ms. |
+| 5 | Skip render-target transfers when the next draw fully overwrites the area | Measured, then dropped. The `[rt-used]` diagnostic shows about 36% of transfer tiles come from draws that look like full overwrites (depth ALWAYS with write, or full-mask no-blend colour rectangles). Skipping **every** transfer, which breaks the picture, only gave a ceiling of 11.1 to 13.1 FPS (GPU wait 28.5 to 18.9 ms). Safely eliding about a third would gain only about 0.5–0.7 FPS. |
+| 6 | Intel driver hidden HiZ/CCS resolves (`INTEL_DEBUG=nohiz` / `noccs`) | No meaningful change (10.7 to 11.2 FPS, within noise). |
+| 7 | Implement "direct resolve" (each resolve currently takes three compute passes) | Not attempted. High risk and high effort. |
+
+**Other dead ends:**
+
+- Fragment-shader-interlock render targets instead of the host render-target
+  path: no faster.
+- Skipping depth transfers: black screen.
+- Reducing the far plane: no gain.
+- Calling the game's `Debug.Set*DrawDistanceMultiplier` natives hides all
+  entities, and the Lua binding crashes.
+- `clock_no_scaling` gave no gain, and toggling it live blacks out the game.
+- VSync on or off: no gain.
+
+**Where it stands.** Even with zero render-target transfers, the UHD 620
+needs about 64 ms per frame just to execute the game's own 2,000–3,000 draws
+through the translated shaders. The retail game has no setting that makes it
+draw less. 30 FPS needs both the CPU and the GPU under 33 ms. The CPU side is
+reachable with items 2–4, which would take it to about 30 ms. The GPU side
+isn't, on this hardware. A dedicated GPU should be much better: once the GPU
+is no longer the limit, items 2–4 become the next things to do and are
+probably the difference between the 20s and 30 FPS.
 
 # Notes for running the game
 - **How to extract (built-in, recommended):** the launcher has an **Extract from ISO** button. Click **Extract from ISO** and pick your disc image (`.iso`). It first checks the iso against the supported-version list, and only once that matches does it extract disc (`default.xex` and `data/`) into the launcher's own folder. No separate tool is required.

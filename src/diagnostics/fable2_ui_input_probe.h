@@ -47,6 +47,9 @@
 #ifdef _WIN32
 #include <windows.h>
 #include <intrin.h>
+#else
+#include <sys/uio.h>
+#include <unistd.h>
 #endif
 
 #include <rex/ppc/context.h>
@@ -452,13 +455,20 @@ inline bool gread(const uint8_t* /*base*/, uint32_t addr, void* dst, size_t n) {
   // Reject protections that fault on read (NOACCESS, guard pages).
   if (mbi.Protect == PAGE_NOACCESS) return false;
   if (mbi.Protect & PAGE_GUARD) return false;
-#endif
   __try {
     std::memcpy(dst, h, n);
     return true;
   } __except (EXCEPTION_EXECUTE_HANDLER) {
     return false;
   }
+#else
+  // process_vm_readv on ourselves fails with EFAULT on an unmapped/protected
+  // page instead of raising SIGSEGV - the POSIX stand-in for __try.
+  iovec local{dst, n};
+  iovec remote{const_cast<uint8_t*>(h), n};
+  return ::process_vm_readv(::getpid(), &local, 1, &remote, 1, 0) ==
+         static_cast<ssize_t>(n);
+#endif
 }
 
 inline bool valid_addr(uint32_t a) {
@@ -669,6 +679,7 @@ inline bool dump_hop_on() {
     const char* v = std::getenv("FABLE2_UIR_IN_HOP");
     return v != nullptr && v[0] == '1';
   }();
+  return on;
 #endif
 }
 

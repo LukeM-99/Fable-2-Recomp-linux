@@ -60,6 +60,7 @@ inline void CloseSock(sock_t s) {
 #else
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <unistd.h>
 using sock_t = int;
@@ -871,6 +872,12 @@ class ControlServer {
           port_.load(), pad_enabled_->load(), IdEcho(v));
     }
 
+    if (cmd == "f5") {
+      // Run the F5 Lua file (f5_lua_path) on the next guest frame, as if F5
+      // had been pressed in the game window.
+      fable2::f5lua::g_f5_pending.store(true);
+      return std::format(R"({{"ok":true{}}})", IdEcho(v));
+    }
     if (cmd == "enable" || cmd == "disable") {
       const bool on = cmd == "enable";
       pad_enabled_->store(on, std::memory_order_relaxed);

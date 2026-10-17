@@ -41,6 +41,9 @@
 //   0x8224270C  call sub_82B9BEC8(r1+80), then the epilogue at 0x82242714.
 #include "fable_2_pch.h"
 
+#include <chrono>
+#include <thread>
+
 extern "C" void FastHelper_821E8D20(PPCContext& ctx, uint8_t* base);
 extern "C" void GpuProgressCheck_82B9BF90(PPCContext& ctx, uint8_t* base);
 extern "C" void __restgprlr_29(PPCContext& ctx, uint8_t* base);
@@ -188,7 +191,14 @@ extern "C" void FrameLimiterWait_82242628(PPCContext& __restrict ctx, uint8_t* b
   // sub_82B9BEC8. The loop leaves on GpuProgressCheck == 0 (beq 0x8224270C)
   // or once the counter reaches the deadline (blt cr6,0x822426E0 not taken).
   BuildArgBlock(ctx, base);
+  // The guest spins here until the GPU thread advances the progress counter.
+  // After a short spin, sleep ~0.1 ms per pass so the wait does not occupy a
+  // whole core the GPU command processor needs (Linux only).
+  int spins = 0;
   while (ctx.cr6.lt != 0) {
+#if defined(__linux__)
+    if (++spins > 32) std::this_thread::sleep_for(std::chrono::microseconds(100));
+#endif
     ctx.r3.s64 = ctx.r1.s64 + kArgBlock;
     ctx.lr = kRetProgressCheck;
     GpuProgressCheck_82B9BF90(ctx, base);

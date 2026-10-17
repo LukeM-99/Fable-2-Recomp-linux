@@ -11,6 +11,7 @@
 #include <rex/rex_app.h>
 #include <rex/system.h>
 #include <rex/system/gpu_plugin.h>
+#include <rex/ui/keybinds.h>
 
 #include <algorithm>
 #include <atomic>
@@ -52,7 +53,17 @@ void record_a_press(std::int64_t ms);
 }
 #endif  // FABLE2_REMOTE_CONTROL
 #include "xex_verify.h"
+#include "linux_sampler.h"
 #include "game_branding.h"
+
+// Base folder for content, saves, cache and config: the exe's own folder, or
+// $FABLE2_HOME when set (the Linux AppImage sets it, since its exe folder is a
+// read-only mount).
+inline std::filesystem::path Fable2HomeDir() {
+  if (const char* home = std::getenv("FABLE2_HOME"); home && *home)
+    return home;
+  return rex::filesystem::GetExecutableFolder();
+}
 
 namespace {
 // The `screenshot` command reads the game's rendered frame from the renderer's
@@ -284,6 +295,21 @@ class Fable2App : public rex::ReXApp {
       }
     }).detach();
 
+    // FABLE2_FPS_LOG=1: log the guest frame time every 2 s (measuring
+    // performance without the F3 overlay, e.g. from the Linux launcher).
+    if (const char* v = std::getenv("FABLE2_FPS_LOG"); v && v[0] == '1') {
+      std::thread([] {
+        for (;;) {
+          std::this_thread::sleep_for(std::chrono::seconds(2));
+          auto ft_us =
+              rex::perf::GetSnapshotCounter(rex::perf::CounterId::kFrameTimeUs);
+          if (ft_us > 0)
+            REXLOG_INFO("[fps] {:.1f} FPS ({:.2f} ms)", 1000000.0 / double(ft_us),
+                        double(ft_us) / 1000.0);
+        }
+      }).detach();
+    }
+
     SetGuestFrameStats([]() {
       rex::ui::FrameStats stats;
       auto ft_us =
@@ -306,9 +332,7 @@ class Fable2App : public rex::ReXApp {
     // This describes the linked build, not a guarantee about DLLs replaced later.
     REXSYS_INFO("[native-build] configuration={} linked_sdk={}",
                 FABLE2_NATIVE_CONFIGURATION, FABLE2_NATIVE_SDK);
-    const std::filesystem::path exe_dir =
-        rex::filesystem::GetExecutableFolder();
-    fable2::config::Load(exe_dir / "fable2_config.toml");
+    fable2::config::Load(Fable2HomeDir() / "fable2_config.toml");
 
     // Seed cvars from the config. Only when the cvar is still at its
     // compiled default (source kDefault), so higher-priority sources --
@@ -406,6 +430,10 @@ class Fable2App : public rex::ReXApp {
     // guest sees null (crashes at startup). Content migrated with an
     // mtime-respecting copy can leave a stale/truncated manifest in place;
     // this appends any file that is on disk but unlisted. Idempotent.
+    fable2::f5lua::InitResolution();
+#if defined(__linux__)
+    fable2::sampler::Start();  // FABLE2_PROFILE=1 only
+#endif
     fable2::manifestheal::EnsureComplete(game_data_root());
 
     // Resolve the host path the same way the SDK does (game:\ / d:\ ->
@@ -506,13 +534,19 @@ class Fable2App : public rex::ReXApp {
   //   <exe>/saves/         <- user data: save files, settings, profiles
   //   <exe>/cache/         <- runtime caches (shader cache, etc.)
   //   <exe>/fable_2.toml   <- cvar config (SDK default)
-  //   <exe>/logs/          <- game logs (SDK default)
+  //   <exe>/logs/          <- game logs (see OnConfigureLogging)
   // The content root is the exe's own directory ONLY (no ancestor walk), so
   // the whole build folder is portable as-is: copy it anywhere and it runs.
   // Override the content location with --game_data_root=<path>.
+  // Logs follow the game folder too (the SDK default is <exe>/logs, which is
+  // read-only inside an AppImage mount).
+  void OnConfigureLogging(rex::LogConfig& config) override {
+    config.log_dir = Fable2HomeDir() / "logs";
+  }
+
   void OnConfigurePaths(rex::PathConfig& paths) override {
-    const std::filesystem::path exe_dir =
-        rex::filesystem::GetExecutableFolder();
+    const std::filesystem::path exe_dir = Fable2HomeDir();
+    paths.config_path = exe_dir / "fable_2.toml";
 
     if (paths.game_data_root.empty()) {
       if (std::filesystem::is_regular_file(exe_dir / "default.xex")) {
@@ -568,6 +602,12 @@ class Fable2App : public rex::ReXApp {
     }
   }
   void OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) override {
+#ifndef _WIN32
+    // F5 -> run the external Lua file (fable2_f5_lua.h). Windows polls the key
+    // with GetAsyncKeyState; elsewhere use the SDK's window key binds.
+    rex::ui::RegisterBind("bind_f5_lua", "F5", "Run the F5 Lua script",
+                          [] { fable2::f5lua::g_f5_pending.store(true); });
+#endif
     // fable2::deadbeef_overlay::register_overlay(drawer);
   }
   // std::unique_ptr<rex::ui::ImGuiDialog> CreateAchievementsOverlay() override;

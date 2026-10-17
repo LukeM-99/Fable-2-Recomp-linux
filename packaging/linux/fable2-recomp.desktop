@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Fable 2 Recompiled
+Comment=Static recompilation of Fable II (Xbox 360)
+Exec=fable_2
+Icon=fable2-recomp
+Categories=Game;
+Terminal=false

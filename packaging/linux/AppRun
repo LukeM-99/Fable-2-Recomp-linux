@@ -1,0 +1,86 @@
+#!/bin/sh
+# AppImage entry point for Fable 2 Recompiled.
+#
+# The AppImage mount is read-only, so content (default.xex + data/), saves,
+# cache, logs and config live in a writable game folder (FABLE2_HOME):
+#   1. $FABLE2_HOME if set
+#   2. the folder holding the .AppImage, if default.xex is there (portable)
+#   3. ${XDG_DATA_HOME:-~/.local/share}/fable2-recomp
+#
+# By default the settings launcher (fable2_launcher) opens first; it can also
+# extract the game from an ISO. --launcher forces it, --no-launcher (or the
+# launcher's "skip next time" box) starts the game directly.
+# Without the launcher and without game files: pass --extract-iso <disc.iso>,
+# or pick the ISO in the file dialog (zenity/kdialog), and default.xex + data/
+# are extracted into the game folder.
+HERE="$(dirname "$(readlink -f "$0")")"
+BIN="$HERE/usr/bin"
+
+if [ -z "$FABLE2_HOME" ]; then
+    if [ -n "$APPIMAGE" ] && [ -f "$(dirname "$APPIMAGE")/default.xex" ]; then
+        FABLE2_HOME="$(dirname "$APPIMAGE")"
+    else
+        FABLE2_HOME="${XDG_DATA_HOME:-$HOME/.local/share}/fable2-recomp"
+    fi
+fi
+export FABLE2_HOME
+mkdir -p "$FABLE2_HOME" || exit 1
+
+msg() {
+    echo "$1" >&2
+    if command -v zenity >/dev/null 2>&1; then zenity --info --no-wrap --text="$1" 2>/dev/null
+    elif command -v kdialog >/dev/null 2>&1; then kdialog --msgbox "$1" 2>/dev/null
+    fi
+}
+
+extract_iso() {
+    echo "Extracting $1 into $FABLE2_HOME ..." >&2
+    python3 -I "$BIN/gdfx_extract.py" "$1" "$FABLE2_HOME" default.xex || return 1
+    python3 -I "$BIN/gdfx_extract.py" "$1" "$FABLE2_HOME" data >/dev/null || return 1
+}
+
+# Recomp Lua scripts (F5 / debug menu); the game adds them to dir.manifest.
+copy_lua() {
+    mkdir -p "$FABLE2_HOME/data/scripts/recomp"
+    cp -u "$HERE"/usr/share/fable2/lua/*.lua "$FABLE2_HOME/data/scripts/recomp/" 2>/dev/null
+}
+
+use_launcher=1
+if grep -qs '^skip_launcher *= *true' "$FABLE2_HOME/launcher.toml"; then use_launcher=0; fi
+case "$1" in
+    --launcher) use_launcher=1; shift ;;
+    --no-launcher) use_launcher=0; shift ;;
+    --extract-iso) use_launcher=0 ;;
+esac
+if [ "$use_launcher" = 1 ] && [ -n "$DISPLAY$WAYLAND_DISPLAY" ]; then
+    # The launcher copies the Lua scripts and execs fable_2 itself.
+    exec "$BIN/fable2_launcher" "$@"
+fi
+
+if [ "$1" = "--extract-iso" ]; then
+    [ -f "$2" ] || { echo "usage: $0 --extract-iso <disc.iso>" >&2; exit 1; }
+    extract_iso "$2" || exit 1
+    shift 2
+fi
+
+if [ ! -f "$FABLE2_HOME/default.xex" ]; then
+    iso=""
+    if command -v zenity >/dev/null 2>&1; then
+        iso="$(zenity --file-selection --title='Select your Fable II disc image (.iso)' --file-filter='*.iso' 2>/dev/null)"
+    elif command -v kdialog >/dev/null 2>&1; then
+        iso="$(kdialog --getopenfilename "$HOME" '*.iso' --title 'Select your Fable II disc image' 2>/dev/null)"
+    fi
+    if [ -z "$iso" ]; then
+        msg "Game files not found in $FABLE2_HOME.
+
+Run with: --extract-iso /path/to/FableII.iso
+or copy default.xex and data/ into that folder."
+        exit 1
+    fi
+    extract_iso "$iso" || { msg "Extraction failed."; exit 1; }
+fi
+
+copy_lua
+
+cd "$FABLE2_HOME" || exit 1
+exec "$BIN/fable_2" "$@"
