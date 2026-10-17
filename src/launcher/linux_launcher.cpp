@@ -20,6 +20,7 @@
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_ONLY_PNG
 #include <stb_image.h>
+#include "../core/xex_verify.h"
 
 #include <algorithm>
 #include <atomic>
@@ -479,6 +480,19 @@ void StartExtraction(const Paths& p, std::string iso) {
   std::thread([p, iso] {
     g_extract.SetStatus("Extracting default.xex ...");
     int rc = RunProcess({"python3", "-I", p.extractor.string(), iso, p.home.string(), "default.xex"});
+    // Check the xex before pulling the ~7 GB data/ tree, like the Windows launcher.
+    if (rc == 0) {
+      std::string hash;
+      if (!fable2::xexverify::Sha256File(p.home / "default.xex", hash) ||
+          !fable2::xexverify::IsAcceptedHash(hash)) {
+        std::error_code ec;
+        fs::remove(p.home / "default.xex", ec);
+        g_extract.SetStatus("Unsupported disc: default.xex SHA-256 " + hash +
+                            " is not a supported Fable II GOTY version.");
+        g_extract.running = false;
+        return;
+      }
+    }
     if (rc == 0) {
       g_extract.SetStatus("Extracting data/ (about 7 GB, this takes a few minutes) ...");
       rc = RunProcess({"python3", "-I", p.extractor.string(), iso, p.home.string(), "data"});

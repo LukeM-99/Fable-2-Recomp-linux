@@ -36,7 +36,8 @@ your progress.
 | `--extract-iso <disc.iso>` | Extract the game without the launcher. |
 
 **Requirements:** x86-64 CPU with SSE4.2 (x86-64-v2), a working Vulkan driver
-(Mesa or NVIDIA), and FUSE (`fusermount`). Without FUSE, use
+(Mesa or NVIDIA), FUSE (`fusermount`), and `python3` for the ISO
+extraction. Without FUSE, use
 `--appimage-extract-and-run`.
 
 ## Launcher settings

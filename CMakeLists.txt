@@ -131,6 +131,8 @@ if(UNIX AND NOT APPLE AND TARGET imgui)
         ${_imgui_dir} ${_imgui_dir}/backends "${REXSDK_DIR}/thirdparty/stb")
     target_link_libraries(fable2_launcher PRIVATE imgui SDL3::SDL3)
     target_compile_features(fable2_launcher PRIVATE cxx_std_20)
+    # Same accepted default.xex hashes as fable_2 (src/core/xex_verify.h).
+    target_compile_definitions(fable2_launcher PRIVATE FABLE2_BUILD_PROFILE="${FABLE2_BUILD_PROFILE}")
     # Finds the bundled libc++ next to it (AppImage usr/bin), like fable_2.
     set_target_properties(fable2_launcher PROPERTIES BUILD_RPATH "\$ORIGIN" INSTALL_RPATH "\$ORIGIN")
     add_dependencies(fable_2 fable2_launcher)
