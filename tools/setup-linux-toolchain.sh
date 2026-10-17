@@ -74,7 +74,7 @@ if [ "$SYSROOT" = 1 ] && [ ! -d "$T/sysroot/usr/include" ]; then
         libudev-dev libdecor-0-dev libpipewire-0.3-dev libspa-0.2-dev libxtst-dev)
     for d in debs/*.deb; do dpkg-deb -x "$d" sysroot; done
     # The .pc files use /usr paths (prefix=, libdir=, ...); point them at the sysroot.
-    sed -i "s|^\([a-z_]*\)=/usr|\1=$T/sysroot/usr|"sysroot/usr/lib/x86_64-linux-gnu/pkgconfig/*.pc sysroot/usr/share/pkgconfig/*.pc 2>/dev/null || true
+    sed -i "s|^\([a-z_]*\)=/usr|\1=$T/sysroot/usr|" sysroot/usr/lib/x86_64-linux-gnu/pkgconfig/*.pc sysroot/usr/share/pkgconfig/*.pc 2>/dev/null || true
     # The -dev .so links are relative to runtime libs the debs don't carry;
     # point them at the host's copies.
     for l in sysroot/usr/lib/x86_64-linux-gnu/*.so; do
