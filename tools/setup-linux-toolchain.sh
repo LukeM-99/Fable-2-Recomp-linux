@@ -39,13 +39,22 @@ if [ ! -x "$T/bin/appimagetool" ]; then
     chmod +x bin/appimagetool
 fi
 
+# appimagetool refuses to run without desktop-file-validate.
+if ! command -v desktop-file-validate >/dev/null && [ ! -x "$T/bin/desktop-file-validate" ]; then
+    echo "== desktop-file-validate"
+    mkdir -p debs dfu
+    (cd debs && apt-get download desktop-file-utils)
+    dpkg-deb -x debs/desktop-file-utils_*.deb dfu
+    cp dfu/usr/bin/desktop-file-validate bin/ && rm -rf dfu
+fi
+
 if [ ! -f "$T/libcxx/lib/libc++.so.1" ]; then
     echo "== libc++ $LLVM_VER (libgcc_s unwinder)"
     SRC="llvm-project-$LLVM_VER.src"
-    if [ ! -d "$SRC/runtimes" ]; then
+    if [ ! -d "$SRC/libc" ]; then
         curl -fL -o llvm-src.tar.xz "https://github.com/llvm/llvm-project/releases/download/llvmorg-$LLVM_VER/$SRC.tar.xz"
         tar xf llvm-src.tar.xz "$SRC/runtimes" "$SRC/libcxx" "$SRC/libcxxabi" "$SRC/libunwind" \
-            "$SRC/cmake" "$SRC/llvm/cmake" "$SRC/llvm/utils" "$SRC/third-party"
+            "$SRC/libc" "$SRC/cmake" "$SRC/llvm/cmake" "$SRC/llvm/utils" "$SRC/third-party"
         rm llvm-src.tar.xz
     fi
     L="$T/LLVM-$LLVM_VER-Linux-X64/bin"
@@ -62,8 +71,15 @@ if [ "$SYSROOT" = 1 ] && [ ! -d "$T/sysroot/usr/include" ]; then
     echo "== sysroot (-dev headers)"
     mkdir -p debs sysroot
     (cd debs && apt-get download libasound2-dev libpulse-dev libx11-xcb-dev libxss-dev \
-        libudev-dev libdecor-0-dev libpipewire-0.3-dev libspa-0.2-dev)
+        libudev-dev libdecor-0-dev libpipewire-0.3-dev libspa-0.2-dev libxtst-dev)
     for d in debs/*.deb; do dpkg-deb -x "$d" sysroot; done
+    # The .pc files use /usr paths (prefix=, libdir=, ...); point them at the sysroot.
+    sed -i "s|^\([a-z_]*\)=/usr|\1=$T/sysroot/usr|"sysroot/usr/lib/x86_64-linux-gnu/pkgconfig/*.pc sysroot/usr/share/pkgconfig/*.pc 2>/dev/null || true
+    # The -dev .so links are relative to runtime libs the debs don't carry;
+    # point them at the host's copies.
+    for l in sysroot/usr/lib/x86_64-linux-gnu/*.so; do
+        [ -e "$l" ] || ln -sf "/usr/lib/x86_64-linux-gnu/$(readlink "$l")" "$l"
+    done
 fi
 
 echo "Toolchain ready in $T. Next: put default.xex in $ROOT and run ./build-linux.sh"

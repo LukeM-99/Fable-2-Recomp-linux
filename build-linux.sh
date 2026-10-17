@@ -85,4 +85,10 @@ cmake -S "$ROOT" -B "$BUILD" -G Ninja \
         -DREXGLUE_BUILD_TESTS=OFF \
         -DFABLE2_FORCE_REMOTE_CONTROL=OFF \
         ${CMAKE_EXTRA_ARGS:-}
+# generated/default/sources.cmake is only read at configure time, so on a
+# fresh checkout run codegen first and reconfigure to pick up its output.
+if [ ! -f "$ROOT/generated/default/sources.cmake" ]; then
+    cmake --build "$BUILD" --target fable_2_codegen -- ${NINJA_ARGS:-}
+    cmake -S "$ROOT" -B "$BUILD"
+fi
 cmake --build "$BUILD" --target "$TARGET" -- ${NINJA_ARGS:-}

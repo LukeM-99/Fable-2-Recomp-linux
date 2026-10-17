@@ -34,6 +34,7 @@ missing="$(cd "$APPDIR/usr/bin" && for f in fable_2 fable2_launcher *.so*; do
     LD_LIBRARY_PATH=. ldd "$f" 2>/dev/null | grep "not found" | sed "s|^|$f: |"; done || true)"
 if [ -n "$missing" ]; then echo "Unresolved libraries:"$'\n'"$missing" >&2; exit 1; fi
 
-APPIMAGE_EXTRACT_AND_RUN=1 ARCH=x86_64 "$ROOT/out/tooling/bin/appimagetool" \
+# appimagetool needs desktop-file-validate (out/tooling/bin, see setup script).
+PATH="$ROOT/out/tooling/bin:$PATH" APPIMAGE_EXTRACT_AND_RUN=1 ARCH=x86_64 "$ROOT/out/tooling/bin/appimagetool" \
     --no-appstream "$APPDIR" "$OUT"
 echo "Built $OUT"
